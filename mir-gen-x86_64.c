@@ -174,6 +174,9 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
   MIR_func_t func = curr_func_item->u.func;
   MIR_proto_t proto = call_insn->ops[0].u.ref->u.proto;
   size_t size, nargs, nops = MIR_insn_nops (ctx, call_insn), start = proto->nres + 2;
+#ifdef _WIN32
+  size_t blk_size; /* exact block size: the value class depends on it */
+#endif
   size_t int_arg_num = 0, fp_arg_num = 0;
   size_t init_arg_stack_size = spill_space_size, arg_stack_size = init_arg_stack_size;
 #ifdef _WIN32
@@ -236,6 +239,9 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
     if (MIR_blk_type_p (type)) {
       gen_assert (arg_op.mode == MIR_OP_VAR_MEM);
       size = (arg_op.u.var_mem.disp + 7) / 8 * 8;
+#ifdef _WIN32
+      blk_size = (size_t) arg_op.u.var_mem.disp;
+#endif
       gen_assert (prev_call_insn != NULL); /* call_insn should not be 1st after simplification */
     }
 #ifndef _WIN32
@@ -295,7 +301,7 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
       int first_p, by_val_p = FALSE;
 
 #ifdef _WIN32
-      by_val_p = size <= 8;
+      by_val_p = win_blk_by_value_p (blk_size);
 #endif
       if (by_val_p) {
         temp_op = _MIR_new_var_op (ctx, gen_new_temp_reg (gen_ctx, MIR_T_I64, func));
@@ -711,7 +717,8 @@ static void target_machinize (gen_ctx_t gen_ctx) {
     /* Argument extensions is already done in simplify */
     /* Prologue: generate arg_var = hard_reg|stack mem|stack addr ... */
     type = VARR_GET (MIR_var_t, func->vars, i).type;
-    blk_size = MIR_blk_type_p (type) ? (VARR_GET (MIR_var_t, func->vars, i).size + 7) / 8 * 8 : 0;
+    size_t blk_bytes = MIR_blk_type_p (type) ? VARR_GET (MIR_var_t, func->vars, i).size : 0;
+    blk_size = (blk_bytes + 7) / 8 * 8;
 #ifndef _WIN32
     if ((type == MIR_T_BLK + 1 && get_int_arg_reg (int_arg_num) != MIR_NON_VAR
          && (blk_size <= 8 || get_int_arg_reg (int_arg_num + 1) != MIR_NON_VAR))
@@ -769,7 +776,7 @@ static void target_machinize (gen_ctx_t gen_ctx) {
 #endif
     int blk_p = MIR_blk_type_p (type);
 #ifdef _WIN32
-    if (blk_p && blk_size > 8) { /* just address */
+    if (blk_p && !win_blk_by_value_p (blk_bytes)) { /* just address */
       blk_p = FALSE;
       type = MIR_T_I64;
     }
@@ -983,6 +990,24 @@ static void target_machinize (gen_ctx_t gen_ctx) {
         gen_add_insn_before (gen_ctx, insn, new_insn);
         insn->ops[nres] = ret_reg_op;
       }
+#ifdef _WIN32
+      /* Win64 ABI: a structure returned through a caller-provided hidden
+         pointer (an RBLK argument) is also returned in RAX.  The caller may
+         read the result through RAX (MSVC generated callers do).  The USE
+         keeps the move from being removed as dead.  Windows does not allow
+         multiple return values, so RAX is free.  */
+      for (i = 0; i < func->nargs; i++)
+        if (VARR_GET (MIR_var_t, func->vars, i).type == MIR_T_RBLK) {
+          MIR_op_t use_op = _MIR_new_var_op (ctx, AX_HARD_REG);
+
+          new_insn = MIR_new_insn (ctx, MIR_MOV, _MIR_new_var_op (ctx, AX_HARD_REG),
+                                   _MIR_new_var_op (ctx, (MIR_reg_t) (i + MAX_HARD_REG + 1)));
+          gen_add_insn_before (gen_ctx, insn, new_insn);
+          new_insn = MIR_new_insn_arr (ctx, MIR_USE, 1, &use_op);
+          gen_add_insn_before (gen_ctx, insn, new_insn);
+          break;
+        }
+#endif
       break;
     }
     case MIR_LSH:

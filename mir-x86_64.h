@@ -25,6 +25,16 @@ static const char *const target_hard_reg_names[] = {
 
 #define MAX_HARD_REG ST1_HARD_REG
 
+#ifdef _WIN32
+/* Win64 passes and returns only 1, 2, 4 and 8-byte aggregates in registers;
+   every other aggregate is passed by reference (and returned through a
+   caller-provided hidden pointer).  A block's exact size lives in the call
+   operand's displacement, so the rounded size can not be used here.  */
+static inline int win_blk_by_value_p (size_t size) {
+  return size == 1 || size == 2 || size == 4 || size == 8;
+}
+#endif
+
 /* Hard regs not used in machinized code, preferably call used ones. */
 static const MIR_reg_t TEMP_INT_HARD_REG1 = R10_HARD_REG, TEMP_INT_HARD_REG2 = R11_HARD_REG;
 #ifndef _WIN32

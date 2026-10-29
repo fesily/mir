@@ -11,8 +11,9 @@
    BLK3 is passed in gpr and then fpr
    BLK4 is passed in fpr and then gpr
    If there are no enough regs, they work as BLK.
-   Windows: small BLKs (<= 8 bytes) are passed by value;
-            all other BLKs is always passed by pointer as regular int arg.  */
+   Windows: 1, 2, 4 and 8-byte BLKs are passed by value in an integer
+            register; all other BLKs are passed by pointer as a regular
+            int arg (and returned through a hidden pointer).  */
 
 #define VA_LIST_IS_ARRAY_P 1
 
@@ -147,7 +148,9 @@ void *va_arg_builtin (void *p, uint64_t t) {
 
 void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase) {
   struct x86_64_va_list *va = p;
-  void *a = s <= 8 ? va->arg_area : *(void **) va->arg_area; /* pass by pointer */
+  /* Win64 passes only 1/2/4/8-byte aggregates by value; the others occupy a
+     pointer slot (same rule as the call/prologue side).  */
+  void *a = win_blk_by_value_p (s) ? va->arg_area : *(void **) va->arg_area;
   if (res != NULL) memcpy (res, a, s);
   va->arg_area++;
 }
@@ -510,7 +513,8 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
       gen_blk_mov (code, sp_offset, (i + nres) * sizeof (long double), qwords);
       sp_offset += qwords * 8;
 #else
-      if (qwords <= 1) {
+      if (win_blk_by_value_p (arg_descs[i].size)) {
+        assert (qwords == 1);
         gen_mov (code, (uint32_t) ((i + nres) * sizeof (long double)), 12,
                  TRUE); /* r12 = mem[disp + rbx] */
         if (n_iregs < max_iregs) {

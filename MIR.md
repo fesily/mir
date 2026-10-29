@@ -53,6 +53,8 @@
        types (`MIR_BLK_NUM = 5`).  The cases used now:
        * x86-64 (SysV): `MIR_T_BLK + 1` -- passed in integer registers, `+ 2` -- in SSE registers,
          `+ 3`/`+ 4` -- the first/second eightbyte in an integer register and the other in an SSE one
+       * x86-64 (Windows): only 1, 2, 4 and 8-byte blocks are passed in an integer register; any
+         other block is passed by pointer (and returned through a caller-provided hidden pointer)
        * aarch64: `MIR_T_BLK + 1`, `+ 2`, `+ 3` -- a homogeneous floating-point aggregate (HFA)
          of 1-4 floats, doubles or long doubles (the member count is the block size divided
          by the member size): passed in consecutive FP registers, or copied to the stack

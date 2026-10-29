@@ -101,6 +101,10 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
     }
     return n_qwords;
 #else
+    /* Win64 passes and returns only 1/2/4/8-byte aggregates in registers;
+       every other aggregate is memory class (passed by reference, returned
+       through a caller-provided hidden pointer).  */
+    if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
     types[0] = MIR_T_I64;
     return 1;
 #endif

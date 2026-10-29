@@ -10871,6 +10871,27 @@ static op_t mem_to_address (c2m_ctx_t c2m_ctx, op_t mem, int reg_p) {
   return mem;
 }
 
+#if defined(_WIN32)
+/* Take the address of a va_list object.  On SysV va_list is an aggregate, so
+   it lives in memory and the MEM branch applies.  On WIN64 the builtin header
+   makes va_list a pointer, which c2mir keeps in a register: MIR_ADDR forces
+   it into a stack slot and yields the object address that va_start/va_arg
+   need (the MIR va_list object holds the argument-area pointer).  */
+static op_t va_list_address (c2m_ctx_t c2m_ctx, op_t op) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_reg_t reg;
+  op_t res;
+
+  if (op.mir_op.mode == MIR_OP_MEM) return mem_to_address (c2m_ctx, op, FALSE);
+  reg = op.mir_op.mode == MIR_OP_VAR ? op.mir_op.u.var : op.mir_op.u.reg;
+  assert (op.mir_op.mode == MIR_OP_VAR || op.mir_op.mode == MIR_OP_REG);
+  res = get_new_temp (c2m_ctx, MIR_T_I64);
+  emit2 (c2m_ctx, MIR_ADDR, res.mir_op, MIR_new_reg_op (ctx, reg));
+  res.mir_op.value_mode = MIR_OP_INT;
+  return res;
+}
+#endif
+
 static op_t force_val (c2m_ctx_t c2m_ctx, op_t op, int arr_p) {
   MIR_context_t ctx = c2m_ctx->ctx;
   op_t temp_op;
@@ -12979,12 +13000,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (va_arg_p) {
       op1 = get_new_temp (c2m_ctx, MIR_T_I64);
       op2 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
+#if defined(_WIN32)
+      op2 = va_list_address (c2m_ctx, op2);
+#else
       if (op2.mir_op.mode == MIR_OP_MEM) {
-#ifndef _WIN32
         if (op2.mir_op.u.mem.type == MIR_T_UNDEF)
-#endif
           op2 = mem_to_address (c2m_ctx, op2, FALSE);
       }
+#endif
       if (type->mode == TM_STRUCT || type->mode == TM_UNION) {
         if (desirable_dest == NULL) {
           /* A struct/union va_arg used as an rvalue (no destination object)
@@ -13027,12 +13050,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
     } else if (va_start_p) {
       op1 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
+#if defined(_WIN32)
+      op1 = va_list_address (c2m_ctx, op1);
+#else
       if (op1.mir_op.mode == MIR_OP_MEM) {
-#ifndef _WIN32
         if (op1.mir_op.u.mem.type == MIR_T_UNDEF)
-#endif
           op1 = mem_to_address (c2m_ctx, op1, FALSE);
       }
+#endif
       MIR_append_insn (ctx, curr_func, MIR_new_insn (ctx, MIR_VA_START, op1.mir_op));
     } else if (alloca_p) {
       res = get_new_temp (c2m_ctx, t);

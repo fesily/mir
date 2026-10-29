@@ -227,6 +227,16 @@ target_link_libraries(gen_sieve mir)
 add_test(gen-test-loop gen_loop)
 add_test(gen-test-sieve gen_sieve)
 
+# ------------------ Win64 C ABI interop test ----------------
+
+if(WIN32)
+  add_executable (win64_abi "mir-tests/win64-abi.c")
+  target_include_directories(win64_abi PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(win64_abi mir)
+
+  add_test(win64-abi-test win64_abi)
+endif()
+
 # ------------------ readme example test ----------------
 
 add_executable (readme_example "mir-tests/readme-example.c")

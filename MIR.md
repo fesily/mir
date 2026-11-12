@@ -824,10 +824,15 @@ main:	  func
     of it (C++ exceptions, `_Unwind_Backtrace`, sampling profilers) can walk
     through generated frames.  The encoded information is a `.eh_frame` like
     block (one CIE with the augmentation `zR`, one FDE per described range, and
-    the zero terminator) registered with `__register_frame`.  The block belongs
-    to the code holder (it is not adjacent to the code) and is unregistered by
-    `__deregister_frame` in `MIR_finish` before the code is unmapped, so
-    generated code stays callable and unwindable after `MIR_gen_finish`.  A
+    the zero terminator) registered with `__register_frame`.  Both
+    `__register_frame` and `__deregister_frame` are resolved at run time (from
+    the already loaded unwinder, otherwise from `libgcc_s.so.1` or
+    `libunwind.so.1`), so `libmir` has no link time dependency on an unwinder and
+    the file keeps working when it is JIT-ed itself.  If neither library is
+    available the publication reports an error instead of leaving generated
+    frames undescribed.  The block belongs to the code holder (it is not adjacent
+    to the code) and is unregistered in `MIR_finish` before the code is unmapped,
+    so generated code stays callable and unwindable after `MIR_gen_finish`.  A
     context (and its JIT code) must not be used or unwound by other threads while
     it is being destroyed
   * Only `rax`, `rdx`, `rcx`, `rbx`, `rsi`, `rdi`, `rbp`, `rsp`, `r8`..`r15` and

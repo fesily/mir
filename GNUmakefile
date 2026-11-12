@@ -74,17 +74,16 @@ else
 
   MIR_LIBS=-lm -ldl
   # The Linux x86-64 JIT frame information (MIR_DWARF_UNWIND in
-  # mir-unwind-target.h) is registered with __register_frame from libgcc_s:
-  # every consumer of libmir (the static one in particular) needs the dependency
-  # and the shared library needs it in its DT_NEEDED entries.  The predicate is
-  # taken from the predefined macros of the *effective* compiler target (like the
-  # header does), not from the default target triple: `-mx32` and the Android
-  # triples contain both x86_64 and linux but disable the support.
+  # mir-unwind-target.h) needs no link time dependency: mir.c resolves
+  # __register_frame/__deregister_frame at run time.  The predicate only decides
+  # whether the Linux unwind test exists here, and it is taken from the predefined
+  # macros of the *effective* compiler target (like the header does), not from the
+  # default target triple: `-mx32` and the Android triples contain both x86_64 and
+  # linux but disable the support.
   CC_DEFS := $(shell $(CC) -dM -E -x c /dev/null 2>/dev/null)
   ifneq (,$(and $(findstring __linux__,$(CC_DEFS)),$(findstring __x86_64__,$(CC_DEFS)),$(findstring __LP64__,$(CC_DEFS))))
     ifeq (,$(findstring __ANDROID__,$(CC_DEFS)))
       MIR_DWARF_UNWIND_P := 1
-      MIR_LIBS += -lgcc_s
     endif
   endif
   COPTFLAGS = -O3 -DNDEBUG

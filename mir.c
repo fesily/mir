@@ -4374,12 +4374,47 @@ static size_t mem_page_size () {
    so that the system unwinder (libgcc_s) can walk through generated frames and
    the runtime wrappers (the target guard is in mir-unwind-target.h).  */
 #if defined(MIR_DWARF_UNWIND)
+#include <dlfcn.h>
+
 #include "mir-dwarf-cfi.h"
 
-/* libgcc_s interface: the registration is void, a failure can not be detected
-   through the return value.  */
-extern void __register_frame (void *begin);
-extern void __deregister_frame (void *begin);
+/* The unwinder interface (libgcc_s, or libunwind which provides the same
+   entry points): both functions are void, so a failure can only be detected by
+   the lookup below.  They are resolved at run time instead of being linked
+   because this file has to keep working when it is JIT-ed itself (the c2mir
+   bootstrap): the run time import resolver of MIR only knows a fixed set of
+   libraries, so a direct reference would leave the generated code with an
+   unresolvable import.  A run time lookup also removes the link time dependency
+   from libmir -- a C++ host already has the unwinder loaded and the first
+   lookup returns that very instance.  */
+typedef void (*frame_fn_t) (void *);
+
+static frame_fn_t frame_register, frame_deregister;
+
+static void *frame_symbol (const char *name) {
+  static const char *const libs[] = {"libgcc_s.so.1", "libunwind.so.1"};
+  void *sym;
+
+  if ((sym = dlsym (RTLD_DEFAULT, name)) != NULL) return sym;
+  for (size_t i = 0; i < sizeof (libs) / sizeof (libs[0]); i++) {
+    void *handler = dlopen (libs[i], RTLD_NOW | RTLD_GLOBAL);
+
+    if (handler != NULL && (sym = dlsym (handler, name)) != NULL) return sym;
+  }
+  return NULL;
+}
+
+/* Registration can not be skipped silently: without it generated frames are
+   invisible to the unwinder, which is the whole point of the target support.  */
+static void frame_init (MIR_context_t ctx) {
+  if (frame_register != NULL) return;
+  frame_register = (frame_fn_t) frame_symbol ("__register_frame");
+  frame_deregister = (frame_fn_t) frame_symbol ("__deregister_frame");
+  if (frame_register == NULL || frame_deregister == NULL)
+    MIR_get_error_func (ctx) (MIR_undeclared_op_ref_error,
+                              "cannot resolve __register_frame/__deregister_frame: neither "
+                              "libgcc_s nor libunwind is available for the JIT frame information");
+}
 
 /* One registration block: a CIE, the FDEs published by one call, and the zero
    terminator.  DATA is what __register_frame was given.  */
@@ -4747,8 +4782,9 @@ uint8_t *_MIR_publish_code_with_unwind (MIR_context_t ctx, const uint8_t *code, 
   VARR_DESTROY (uint8_t, block);
   MIR_free (ctx->alloc, ranges);
   /* Register before the caller gets the entry point.  The block is immovable
-     (libgcc_s keeps the pointer) and lives as long as the code.  */
-  __register_frame (fb->data);
+     (the unwinder keeps the pointer) and lives as long as the code.  */
+  frame_init (ctx);
+  frame_register (fb->data);
   fb->next = ch_ptr->fde_blocks;
   ch_ptr->fde_blocks = fb;
   return res;
@@ -4965,7 +5001,7 @@ static void code_finish (MIR_context_t ctx) {
 
     for (fb = ch_ptr->fde_blocks; fb != NULL; fb = next) {
       next = fb->next;
-      __deregister_frame (fb->data);
+      if (frame_deregister != NULL) frame_deregister (fb->data);
       MIR_free (ctx->alloc, fb->data);
       MIR_free (ctx->alloc, fb);
     }

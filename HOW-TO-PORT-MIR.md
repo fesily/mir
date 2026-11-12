@@ -65,7 +65,10 @@ examine existing files `mir-x86_64.c`, `mir-aarhc64.c`,
     CIE/FDE: the publisher writes the CIE (version 1, augmentation `zR`, absolute
     addresses, `CFA = rsp+8` and the return address at `CFA-8` at the entry), one
     FDE per range and the zero terminator into an immovable registration block,
-    and registers it with `__register_frame` of `libgcc_s`.  An *empty* stream is
+    and registers it with `__register_frame`.  That entry point (and
+    `__deregister_frame`) is resolved at run time, not linked: the JIT-ed form of
+    `mir.c` resolves its imports from a fixed set of libraries, and `libmir`
+    should not force an unwinder on its consumers.  An *empty* stream is
     valid there and describes exactly the CIE default rules; this is how a leaf
     frame is described (libgcc has no default rule for code without an FDE).
   * The block belongs to the MIR code holder: it outlives the generator and is

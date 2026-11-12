@@ -60,12 +60,9 @@ if(Threads_FOUND)
 endif()
 if(UNIX)
 	target_link_libraries(mir PUBLIC m)
-	# __register_frame/__deregister_frame come from libgcc_s: the dependency has
-	# to reach the static and the shared library as well as every consumer of the
-	# object library.
-	if(MIR_DWARF_UNWIND_P)
-		target_link_libraries(mir PUBLIC gcc_s)
-	endif()
+	# __register_frame/__deregister_frame are resolved at run time (see mir.c): a
+	# link time dependency would leave the JIT-ed mir.c of the c2mir bootstrap with
+	# an import its resolver cannot satisfy, and consumers would have to carry it.
 endif()
 
 # ------------------ LIBMIR -----------------------
@@ -285,28 +282,22 @@ if(MIR_DWARF_UNWIND_P)
   add_test(dwarf-unwind-allocator linux_dwarf_unwind allocator)
   add_test(dwarf-unwind-jret linux_dwarf_unwind jret)
 
-  # The link contract: a pure C host links the shared library without adding
-  # libgcc_s itself (it has to come from the DT_NEEDED entry) and the static
-  # library with the dependency propagated by the target.
+  # A pure C host which only uses MIR (the shared and the static library): the
+  # unwinder is not a dependency of libmir any more, mir.c resolves it at run
+  # time, so these are the checks that a host which never links an unwinder still
+  # gets its generated frames described and registered.
   add_executable (linux_dwarf_host_shared "mir-tests/linux-dwarf-host.c")
   target_include_directories(linux_dwarf_host_shared PRIVATE ${PROJECT_SOURCE_DIR})
-  # the sources call _Unwind_* themselves; a shared library dependency is not
-  # propagated to the executable link, and gcc only masks that with its implicit
-  # -lgcc_s (clang with --rtlib=compiler-rt does not)
+  # the source itself calls _Unwind_*, and gcc only masks a missing -lgcc_s with
+  # its implicit one (clang with --rtlib=compiler-rt does not)
   target_link_libraries(linux_dwarf_host_shared mir_shared gcc_s)
   add_test(dwarf-unwind-host-shared linux_dwarf_host_shared)
 
   add_executable (linux_dwarf_host_static "mir-tests/linux-dwarf-host.c")
   target_include_directories(linux_dwarf_host_static PRIVATE ${PROJECT_SOURCE_DIR})
-  target_link_libraries(linux_dwarf_host_static mir_static)
+  target_link_libraries(linux_dwarf_host_static mir_static gcc_s)
   add_test(dwarf-unwind-host-static linux_dwarf_host_static)
 
-  # The two host runs above are smoke tests only: gcc appends -lgcc_s to every
-  # executable link, so they would also link and run if the shared library had no
-  # dependency on it.  The dependency itself is what has to be asserted, so it is
-  # read from the artifact.
-  add_test(NAME dwarf-unwind-shared-needed
-           COMMAND sh -c "readelf -d '$<TARGET_FILE:mir_shared>' | grep -q libgcc_s")
 
   # The plain target paths (macOS, *BSD, x32, Android) are compiled and run here
   # by disabling the unwind support: this is the only automated check that those

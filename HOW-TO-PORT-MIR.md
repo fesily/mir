@@ -22,6 +22,103 @@ examine existing files `mir-x86_64.c`, `mir-aarhc64.c`,
   `_MIR_change_code`, `_MIR_update_code`, and `_MIR_update_code_arr` to
   work with executable code.
 
+  Note about code publishing and stack unwinding on Windows x64:
+  
+  * Any published code which can be on the stack while an exception is
+    dispatched, a stack trace is taken, or a sampling profiler unwinds has to
+    carry unwind information.  Use `_MIR_publish_code_with_unwind` for that: it
+    takes the published code, a set of half open `[begin,end)` ranges inside it,
+    and the version 1 `UNWIND_INFO` bytes for every range, copies the metadata
+    next to the code, and registers the runtime function entries.  The
+    `mir-win64-unwind.h` builder (`mir_win64_unwind_*`) encodes the operations
+    from the real prologue instruction ends.
+  * Registration uses `RtlAddGrowableFunctionTable` when the whole API is
+    available and `RtlAddFunctionTable` otherwise; a failure is a MIR error, not
+    a silent "leaf frame".  The runtime function array of a growable table has to
+    stay at a stable address and its entries have to be added in the increasing
+    `BeginAddress` order, so the MIR code holder owns it and never reallocates it.
+  * The tables have to outlive the generator (generated code can be called and
+    unwound after `MIR_gen_finish`) and have to be deleted in `MIR_finish` before
+    the code is unmapped.  Destroying a context therefore requires that no other
+    thread executes or unwinds its JIT code.
+  * The prologue of an unwindable function must consist only of operations the
+    format can describe: pushes of non-volatile registers, RSP allocations, an
+    optional frame register establishment (`push rbp; sub rsp,N; lea rbp,[rsp+F]`
+    with the `FrameOffset` field equal to F/16, so the frame base is fixed), and
+    saves of non-volatile registers at fixed frame base offsets.  The epilogue
+    has to be the exact mirror and must not contain anything but the register
+    restores, the stack release, and `ret`/a tail jump.
+  * A frame whose code offsets or prologue length do not fit the 255 byte limit,
+    or whose allocation/offset is not representable, is a MIR error: never emit
+    truncated metadata.
+  * Functions entered through a body branch (lazy basic block fragments, bb
+    thunks) use the *inherited* rule of their function: the same operations with
+    zero code offsets and a zero prologue size.  bb thunks call their wrapper, so
+    the thunk is split into three ranges (before the stack adjustment, the
+    adjustment plus the call, and after the adjustment) and the entry thunk of a
+    function uses the leaf rule instead.
+
+  Note about code publishing and stack unwinding on Linux x86-64:
+
+  * The same `_MIR_publish_code_with_unwind` interface is used, but the `info`
+    of a range is a DWARF `DW_CFA` instruction stream and not a complete
+    CIE/FDE: the publisher writes the CIE (version 1, augmentation `zR`, absolute
+    addresses, `CFA = rsp+8` and the return address at `CFA-8` at the entry), one
+    FDE per range and the zero terminator into an immovable registration block,
+    and registers it with `__register_frame` of `libgcc_s`.  An *empty* stream is
+    valid there and describes exactly the CIE default rules; this is how a leaf
+    frame is described (libgcc has no default rule for code without an FDE).
+  * The block belongs to the MIR code holder: it outlives the generator and is
+    unregistered with `__deregister_frame` in `MIR_finish` before the code is
+    unmapped.  A block is never extended after the registration, so every publish
+    gets its own block.
+  * `mir-dwarf-cfi.h` provides the instruction emitters (`mir_dwarf_cfi_*`) and
+    the CIE/FDE assembler (`mir_dwarf_cfi_assemble`).  The rows must be emitted
+    at *instruction ends* (the unwinder looks up the return PC minus one) and
+    after the branch lengths and the code alignment are final, which is why the
+    generator collects the events with their MIR insn anchors and translates the
+    offsets while the insns are emitted.
+  * Register rules are CFA relative, so they survive every change of the CFA.
+    The CFA itself is `rsp+8` based for a function without a frame register and
+    switches to the frame register (`rbp+16`, giving the saved `rbp` at
+    `CFA-16`) as soon as it is established; it has to switch back to the `rsp`
+    form in the epilogue *before* the `rbp` load restores the caller value.
+  * A dynamic `rsp` is only describable through a frame register: MIR forces one
+    for `alloca`, for a `vararg` function, and for a function which receives BLK
+    arguments or arguments on the stack.  The inline `bstart`/`bend` do not need
+    a frame register by themselves (they restore the very same `rsp`), only an
+    `alloca` between them forces it.  A stack *switch* has no describable frame
+    at all, so the `bend` stub is described only up to the switch.
+  * The `sub`/`add` of `rsp` which allocate the stack arguments of a call are
+    ordinary instructions outside the prologue/epilogue; with an `rsp` based CFA
+    each of them moves the CFA and is described by a separate row.
+  * Functions entered through a body branch (lazy basic block fragments) get the
+    *body* rules of their function (all prologue events with no code offset) as
+    their entry state and then their own epilogue rows.  A bb thunk reserves the
+    128-byte red zone of the enclosing frame, *calls* the shared wrapper (which
+    therefore has a real return address) and releases the reservation before the
+    jump to the fragment; its ranges are the unadjusted body rules, the adjusted
+    ones and the unadjusted ones again.  Because the thunk is entered by a jump,
+    the unwinder reports the thunk frame and then the caller of the enclosing
+    function: the body frame is merged with the thunk frame, which is exactly why
+    the thunk has to carry the whole body state.
+  * The reservation of a bb thunk is `128` bytes plus the 8 bytes of the call it
+    makes, i.e. `136` for a function entry and for the body of a real leaf (where
+    `rsp` is 8 modulo 16 on entry to the thunk) and `128` for the body of every
+    function with a prologue, whose own allocation leaves `rsp` 16-byte aligned.
+    The reservation is what keeps the wrapper call 16-byte aligned; the thunk has
+    to release all `128`/`136` bytes before the jump to the fragment, so the
+    fragment starts in the body state which the inherited rules describe.
+    Windows x64 uses the same split with its own numbers (`32` and `40`), because
+    its wrapper call also has to keep the shadow space and the call itself
+    aligned; there the added `UWOP_ALLOC` is the *last* prologue operation, so it
+    is the first code in the encoded array and is undone before the inherited
+    save rules are applied.
+  * `MIR_JCALL`/`MIR_JRET` continuation functions get no FDE: the continuation is
+    entered by a jump into a caller which has no return address of its own, so it
+    has no describable frame in either ABI.  Their thunk only reserves the red
+    zone (`128`, `rsp` is 16-byte aligned there) and publishes no metadata.
+
   Here is the list of the common function you should provide:
   
   * `void *_MIR_get_thunk (MIR_context_t ctx)` generates small code (thunk) and

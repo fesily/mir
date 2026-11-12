@@ -4359,18 +4359,95 @@ static size_t mem_page_size () {
 }
 #endif
 
+/* Windows x64 (JIT only): generated code has to carry unwind information so
+   that the Windows unwinder can walk through generated frames and the runtime
+   wrappers.  The published metadata is kept and registered together with the
+   code holder it belongs to: generated functions can be executed (and
+   unwound) after MIR_gen_finish, so the tables cannot belong to the
+   generator.  */
+#include "mir-unwind-target.h"
+#if defined(MIR_WIN64_UNWIND)
+#include "mir-win64-unwind.h"
+#endif
+
+/* Linux x86-64 (JIT only): generated code carries DWARF call frame information
+   so that the system unwinder (libgcc_s) can walk through generated frames and
+   the runtime wrappers (the target guard is in mir-unwind-target.h).  */
+#if defined(MIR_DWARF_UNWIND)
+#include "mir-dwarf-cfi.h"
+
+/* libgcc_s interface: the registration is void, a failure can not be detected
+   through the return value.  */
+extern void __register_frame (void *begin);
+extern void __deregister_frame (void *begin);
+
+/* One registration block: a CIE, the FDEs published by one call, and the zero
+   terminator.  DATA is what __register_frame was given.  */
+struct code_fde_block {
+  void *data;
+  struct code_fde_block *next;
+};
+#endif
+
+#if defined(MIR_WIN64_UNWIND)
+/* The layout of RUNTIME_FUNCTION.  The field names differ between the Windows
+   SDK (UnwindInfoAddress) and some MinGW headers (UnwindData), so the type is
+   defined here and only cast at the API boundary.  */
+typedef struct _MIR_win64_runtime_function {
+  DWORD begin_address, end_address, unwind_info_address;
+} MIR_win64_runtime_function_t;
+
+/* Registered by RtlAddFunctionTable when the growable API is not available.
+   The array has to stay alive and stable until RtlDeleteFunctionTable.  */
+struct code_rf_array {
+  MIR_win64_runtime_function_t *entries;
+  struct code_rf_array *next;
+};
+#endif
+
 struct code_holder {
   uint8_t *start, *free, *bound;
+#if defined(MIR_DWARF_UNWIND)
+  /* The .eh_frame like registration blocks of this holder.  Every publish gets
+     an own immovable block (libgcc_s keeps the pointer) and blocks are never
+     extended after registration.  */
+  struct code_fde_block *fde_blocks;
+#endif
+#if defined(MIR_WIN64_UNWIND)
+  /* The array passed to RtlAddGrowableFunctionTable: stable (never reallocated)
+     and RW (the OS writes the sorted index into it).  */
+  MIR_win64_runtime_function_t *rf;
+  size_t rf_len, rf_cap;
+  void *growable; /* RtlAddGrowableFunctionTable handle or NULL */
+  struct code_rf_array *fallback;
+#endif
 };
 
 typedef struct code_holder code_holder_t;
 
 DEF_VARR (code_holder_t);
 
+#if defined(MIR_WIN64_UNWIND)
+typedef ULONG (NTAPI *rtl_add_growable_func_t) (void **dynamic_table,
+                                                MIR_win64_runtime_function_t *function_table,
+                                                ULONG entry_count, ULONG maximum_entry_count,
+                                                ULONG_PTR range_base, ULONG_PTR range_end);
+/* RtlGrowFunctionTable has no return value (it is declared VOID), so a grow
+   failure can not be observed: only RtlAddGrowableFunctionTable is checked.  */
+typedef void (NTAPI *rtl_grow_func_t) (void *dynamic_table, ULONG new_entry_count);
+typedef void (NTAPI *rtl_delete_growable_func_t) (void *dynamic_table);
+#endif
+
 struct machine_code_ctx {
   VARR (code_holder_t) * code_holders;
   size_t page_size;
   uint8_t *code_reserve_start, *code_reserve_free, *code_reserve_bound;
+#if defined(MIR_WIN64_UNWIND)
+  SRWLOCK code_lock; /* serializes publishing, registration, and code patching */
+  rtl_add_growable_func_t add_growable;
+  rtl_grow_func_t grow;
+  rtl_delete_growable_func_t delete_growable;
+#endif
 };
 
 #define code_holders ctx->machine_code_ctx->code_holders
@@ -4378,6 +4455,16 @@ struct machine_code_ctx {
 #define code_reserve_start ctx->machine_code_ctx->code_reserve_start
 #define code_reserve_free ctx->machine_code_ctx->code_reserve_free
 #define code_reserve_bound ctx->machine_code_ctx->code_reserve_bound
+
+#if defined(MIR_WIN64_UNWIND)
+#define code_lock ctx->machine_code_ctx->code_lock
+#define add_growable ctx->machine_code_ctx->add_growable
+#define grow_function_table ctx->machine_code_ctx->grow
+#define delete_growable ctx->machine_code_ctx->delete_growable
+
+static void lock_code (MIR_context_t ctx) { AcquireSRWLockExclusive (&code_lock); }
+static void unlock_code (MIR_context_t ctx) { ReleaseSRWLockExclusive (&code_lock); }
+#endif
 
 /* Generated code, thunks, and wrappers reference each other with direct
    branches whose reach is limited on some targets (e.g. +-128MB on aarch64).
@@ -4398,11 +4485,70 @@ struct machine_code_ctx {
 #endif
 #endif
 
-static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
+#if defined(MIR_WIN64_UNWIND)
+#define MIN_RF_CAPACITY 128
+#define MAX_RF_ENTRIES_PER_PUBLISH 4096
+
+/* Allocate a new code holder for a code blob of size SIZE and with room for
+   N_RF runtime function entries.  RF arrays are allocated through the MIR
+   allocator: they are metadata, not code.  */
+static code_holder_t *new_code_holder (MIR_context_t ctx, size_t size, size_t n_rf) {
   uint8_t *mem;
   size_t len, npages;
-  code_holder_t ch, *ch_ptr;
+  code_holder_t ch;
 
+  npages = (size + page_size) / page_size;
+  len = page_size * npages;
+  if (code_reserve_start != NULL && (size_t) (code_reserve_bound - code_reserve_free) >= len) {
+    mem = code_reserve_free;
+    code_reserve_free += len;
+  } else {
+    mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, len);
+    if (mem == MAP_FAILED) return NULL;
+  }
+  ch.start = mem;
+  ch.free = mem;
+  ch.bound = mem + len;
+  ch.rf = NULL;
+  ch.rf_len = ch.rf_cap = 0;
+  ch.growable = NULL;
+  ch.fallback = NULL;
+  if (n_rf != 0) {
+    ch.rf_cap = n_rf < MIN_RF_CAPACITY ? MIN_RF_CAPACITY : n_rf;
+    if ((ch.rf = MIR_malloc (ctx->alloc, ch.rf_cap * sizeof (MIR_win64_runtime_function_t)))
+        == NULL) {
+      if (code_reserve_start == NULL || mem < code_reserve_start || mem >= code_reserve_bound)
+        MIR_mem_unmap (ctx->code_alloc, mem, len);
+      return NULL; /* the caller reports the failure after releasing the lock */
+    }
+  }
+  VARR_PUSH (code_holder_t, code_holders, ch);
+  len = VARR_LENGTH (code_holder_t, code_holders);
+  return VARR_ADDR (code_holder_t, code_holders) + len - 1;
+}
+#endif
+
+/* Return a holder with SIZE free bytes (and, on Windows x64, room for N_RF
+   more runtime function entries).  */
+static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size, size_t n_rf) {
+  size_t len;
+  code_holder_t *ch_ptr;
+
+#if defined(MIR_WIN64_UNWIND)
+  if ((len = VARR_LENGTH (code_holder_t, code_holders)) > 0) {
+    ch_ptr = VARR_ADDR (code_holder_t, code_holders) + len - 1;
+    ch_ptr->free = (uint8_t *) ((uint64_t) (ch_ptr->free + 15) / 16 * 16); /* align */
+    if (ch_ptr->free + size <= ch_ptr->bound
+        && (n_rf == 0 || ch_ptr->rf_cap - ch_ptr->rf_len >= n_rf))
+      return ch_ptr;
+  }
+  return new_code_holder (ctx, size, n_rf);
+#else
+  uint8_t *mem;
+  size_t npages;
+  code_holder_t ch;
+
+  (void) n_rf;
   if ((len = VARR_LENGTH (code_holder_t, code_holders)) > 0) {
     ch_ptr = VARR_ADDR (code_holder_t, code_holders) + len - 1;
     ch_ptr->free = (uint8_t *) ((uint64_t) (ch_ptr->free + 15) / 16 * 16); /* align */
@@ -4420,9 +4566,13 @@ static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   ch.start = mem;
   ch.free = mem;
   ch.bound = mem + len;
+#if defined(MIR_DWARF_UNWIND)
+  ch.fde_blocks = NULL;
+#endif
   VARR_PUSH (code_holder_t, code_holders, ch);
   len = VARR_LENGTH (code_holder_t, code_holders);
   return VARR_ADDR (code_holder_t, code_holders) + len - 1;
+#endif
 }
 
 void _MIR_flush_code_cache (void *start, void *bound) {
@@ -4460,23 +4610,239 @@ static uint8_t *add_code (MIR_context_t ctx MIR_UNUSED, code_holder_t *ch_ptr, c
   return mem;
 }
 
+static uint8_t *publish_code_no_lock (MIR_context_t ctx, const uint8_t *code, size_t code_len) {
+  code_holder_t *ch_ptr;
+
+  if ((ch_ptr = get_last_code_holder (ctx, code_len, 0)) == NULL) return NULL;
+  return add_code (ctx, ch_ptr, code, code_len);
+}
+
 uint8_t *_MIR_publish_code (MIR_context_t ctx, const uint8_t *code,
                             size_t code_len) { /* thread safe */
-  code_holder_t *ch_ptr;
-  uint8_t *res = NULL;
+#if defined(MIR_WIN64_UNWIND)
+  uint8_t *res;
 
-  if ((ch_ptr = get_last_code_holder (ctx, code_len)) != NULL)
-    res = add_code (ctx, ch_ptr, code, code_len);
+  lock_code (ctx);
+  res = publish_code_no_lock (ctx, code, code_len);
+  unlock_code (ctx);
   return res;
+#else
+  return publish_code_no_lock (ctx, code, code_len);
+#endif
+}
+
+#if defined(MIR_WIN64_UNWIND)
+/* Append data to the holder (the whole holder is switched to RWX for the
+   copy).  The holder must have room, which the caller reserved.  */
+static uint8_t *append_holder_data (MIR_context_t ctx, code_holder_t *ch_ptr, const uint8_t *data,
+                                    size_t len) {
+  uint8_t *mem = ch_ptr->free;
+
+  ch_ptr->free += len;
+  mir_assert (ch_ptr->free <= ch_ptr->bound);
+  MIR_code_reloc_t reloc;
+  reloc.offset = 0;
+  reloc.value = data;
+  _MIR_set_code (ctx->code_alloc, (size_t) ch_ptr->start, ch_ptr->bound - ch_ptr->start, mem, 1,
+                 &reloc, len);
+  _MIR_flush_code_cache (mem, ch_ptr->free);
+  return mem;
+}
+
+/* Register the N entries which were just appended to the holder table.  Return
+   0 on success, 1 when the system refused to register them, and 2 when memory
+   for the fallback registration ran out.  The caller reports the failure after
+   releasing the publishing lock (a non-returning error handler must not leave
+   the lock acquired).  */
+static int register_holder_entries (MIR_context_t ctx, code_holder_t *ch_ptr, size_t n) {
+  struct code_rf_array *fa;
+  ULONG status;
+
+  if (add_growable != NULL) {
+    if (ch_ptr->growable == NULL) {
+      status = add_growable (&ch_ptr->growable, ch_ptr->rf, 0, (ULONG) ch_ptr->rf_cap,
+                             (ULONG_PTR) ch_ptr->start, (ULONG_PTR) ch_ptr->bound);
+      if (status != 0) ch_ptr->growable = NULL;
+    }
+    if (ch_ptr->growable != NULL) {
+      grow_function_table (ch_ptr->growable, (ULONG) ch_ptr->rf_len);
+      return 0;
+    }
+    return 1;
+  }
+  /* No growable API in this system: register an own stable array per publish. */
+  if ((fa = MIR_malloc (ctx->alloc, sizeof (struct code_rf_array))) == NULL) return 2;
+  if ((fa->entries = MIR_malloc (ctx->alloc, n * sizeof (MIR_win64_runtime_function_t)))
+      == NULL) {
+    MIR_free (ctx->alloc, fa);
+    return 2;
+  }
+  memcpy (fa->entries, ch_ptr->rf + ch_ptr->rf_len - n,
+          n * sizeof (MIR_win64_runtime_function_t));
+  if (!RtlAddFunctionTable ((PRUNTIME_FUNCTION) fa->entries, (DWORD) n,
+                            (DWORD64) (uintptr_t) ch_ptr->start)) {
+    MIR_free (ctx->alloc, fa->entries);
+    MIR_free (ctx->alloc, fa);
+    return 1;
+  }
+  fa->next = ch_ptr->fallback;
+  ch_ptr->fallback = fa;
+  return 0;
+}
+#endif
+
+uint8_t *_MIR_publish_code_with_unwind (MIR_context_t ctx, const uint8_t *code, size_t code_len,
+                                        size_t n, const struct _MIR_code_unwind *unwind) {
+#if defined(MIR_DWARF_UNWIND)
+  code_holder_t *ch_ptr;
+  struct code_fde_block *fb;
+  struct mir_dwarf_cfi_range *ranges;
+  VARR (uint8_t) * block;
+  uint8_t *res;
+  size_t i, len;
+
+  if (n == 0) return _MIR_publish_code (ctx, code, code_len);
+  if (unwind == NULL) {
+    MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                              "internal: wrong Linux x86-64 unwind metadata");
+    return NULL;
+  }
+  for (i = 0; i < n; i++) {
+    if ((unwind[i].info == NULL && unwind[i].info_len != 0) || unwind[i].begin >= unwind[i].end
+        || unwind[i].end > code_len
+        || (i != 0 && unwind[i - 1].end > unwind[i].begin)) {
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: wrong Linux x86-64 unwind range");
+      return NULL;
+    }
+  }
+  if ((ch_ptr = get_last_code_holder (ctx, code_len, 0)) == NULL) {
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for generated code");
+    return NULL;
+  }
+  res = add_code (ctx, ch_ptr, code, code_len);
+  ranges = MIR_malloc (ctx->alloc, n * sizeof (struct mir_dwarf_cfi_range));
+  if (ranges == NULL) {
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for unwind data");
+    return NULL;
+  }
+  for (i = 0; i < n; i++) {
+    ranges[i].begin = (uintptr_t) (res + unwind[i].begin);
+    ranges[i].end = (uintptr_t) (res + unwind[i].end);
+    ranges[i].insns = unwind[i].info;
+    ranges[i].insns_len = unwind[i].info_len;
+  }
+  VARR_CREATE (uint8_t, block, ctx->alloc, 128);
+  mir_dwarf_cfi_assemble (block, n, ranges);
+  len = VARR_LENGTH (uint8_t, block);
+  fb = MIR_malloc (ctx->alloc, sizeof (struct code_fde_block));
+  if (fb == NULL || (fb->data = MIR_malloc (ctx->alloc, len)) == NULL) {
+    if (fb != NULL) MIR_free (ctx->alloc, fb);
+    VARR_DESTROY (uint8_t, block);
+    MIR_free (ctx->alloc, ranges);
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for unwind data");
+    return NULL;
+  }
+  memcpy (fb->data, VARR_ADDR (uint8_t, block), len);
+  VARR_DESTROY (uint8_t, block);
+  MIR_free (ctx->alloc, ranges);
+  /* Register before the caller gets the entry point.  The block is immovable
+     (libgcc_s keeps the pointer) and lives as long as the code.  */
+  __register_frame (fb->data);
+  fb->next = ch_ptr->fde_blocks;
+  ch_ptr->fde_blocks = fb;
+  return res;
+#elif !defined(MIR_WIN64_UNWIND)
+  (void) n;
+  (void) unwind;
+  return _MIR_publish_code (ctx, code, code_len);
+#else
+  code_holder_t *ch_ptr;
+  uint8_t *res, *mem;
+  size_t total, i;
+  DWORD last_begin = 0;
+  int have_last, status;
+
+  if (n == 0) return _MIR_publish_code (ctx, code, code_len);
+  if (unwind == NULL || n > MAX_RF_ENTRIES_PER_PUBLISH)
+    MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                              "internal: wrong Windows x64 unwind metadata");
+  total = code_len;
+  for (i = 0; i < n; i++) {
+    if (unwind[i].info == NULL || unwind[i].info_len == 0 || unwind[i].begin >= unwind[i].end
+        || unwind[i].end > code_len)
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: wrong Windows x64 unwind range");
+    if (i != 0 && unwind[i - 1].end > unwind[i].begin)
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: Windows x64 unwind ranges are not ordered");
+    if (unwind[i].info_len > 0xffffffffu) /* before any subtraction: size_t is wider */
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: Windows x64 unwind data longer than a DWORD");
+    /* DWORD aligned xdata, with an explicit overflow check at every step: the
+       whole holder, the RVAs inside it and the lengths have to fit DWORDs.  */
+    if (total > 0xffffffffu - 3 || total + 3 > 0xffffffffu - unwind[i].info_len)
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: too large code holder for Windows x64 unwind data");
+    total = (total + 3) / 4 * 4;
+    total += unwind[i].info_len;
+  }
+  if (total > 0xffffffffu)
+    MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                              "internal: too large code holder for Windows x64 unwind data");
+  lock_code (ctx);
+  if ((ch_ptr = get_last_code_holder (ctx, total, n)) == NULL) {
+    unlock_code (ctx);
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for generated code");
+  }
+  res = add_code (ctx, ch_ptr, code, code_len);
+  have_last = ch_ptr->rf_len != 0;
+  if (have_last) last_begin = ch_ptr->rf[ch_ptr->rf_len - 1].begin_address;
+  for (i = 0; i < n; i++) {
+    size_t begin = (size_t) (res + unwind[i].begin - ch_ptr->start);
+    size_t end = (size_t) (res + unwind[i].end - ch_ptr->start);
+    MIR_win64_runtime_function_t *rf = &ch_ptr->rf[ch_ptr->rf_len + i];
+
+    ch_ptr->free = (uint8_t *) ((uint64_t) (ch_ptr->free + 3) / 4 * 4); /* DWORD aligned xdata */
+    mem = append_holder_data (ctx, ch_ptr, unwind[i].info, unwind[i].info_len);
+    if (begin > 0xffffffffu || end > 0xffffffffu
+        || (size_t) (mem - ch_ptr->start) > 0xffffffffu
+        || (have_last ? begin <= last_begin : 0)) {
+      unlock_code (ctx);
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "internal: cannot represent Windows x64 unwind data");
+    }
+    rf->begin_address = (DWORD) begin;
+    rf->end_address = (DWORD) end;
+    rf->unwind_info_address = (DWORD) (mem - ch_ptr->start);
+  }
+  ch_ptr->rf_len += n;
+  if ((status = register_holder_entries (ctx, ch_ptr, n)) != 0) { /* do not leave half state */
+    ch_ptr->rf_len -= n;
+    unlock_code (ctx);
+    if (status == 1)
+      MIR_get_error_func (ctx) (MIR_alloc_error, "cannot register Windows x64 unwind table");
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for unwind table");
+  }
+  unlock_code (ctx);
+  return res;
+#endif
 }
 
 uint8_t *_MIR_publish_code_by_addr (MIR_context_t ctx, void *addr, const uint8_t *code,
                                     size_t code_len) {
-  code_holder_t *ch_ptr = get_last_code_holder (ctx, 0);
+  code_holder_t *ch_ptr;
   uint8_t *res = NULL;
 
+#if defined(MIR_WIN64_UNWIND)
+  lock_code (ctx);
+#endif
+  ch_ptr = get_last_code_holder (ctx, 0, 0);
   if (ch_ptr != NULL && ch_ptr->free == addr && ch_ptr->free + code_len <= ch_ptr->bound)
     res = add_code (ctx, ch_ptr, code, code_len);
+#if defined(MIR_WIN64_UNWIND)
+  unlock_code (ctx);
+#endif
   return res;
 }
 
@@ -4489,8 +4855,14 @@ void _MIR_change_code (MIR_context_t ctx, uint8_t *addr, const uint8_t *code,
   len = (size_t) addr + code_len - start;
   reloc.offset = 0;
   reloc.value = code;
+#if defined(MIR_WIN64_UNWIND)
+  lock_code (ctx);
+#endif
   _MIR_set_code (ctx->code_alloc, start, len, addr, 1, &reloc, code_len);
   _MIR_flush_code_cache (addr, addr + code_len);
+#if defined(MIR_WIN64_UNWIND)
+  unlock_code (ctx);
+#endif
 }
 
 void _MIR_update_code_arr (MIR_context_t ctx, uint8_t *base, size_t nloc,
@@ -4502,8 +4874,14 @@ void _MIR_update_code_arr (MIR_context_t ctx, uint8_t *base, size_t nloc,
     if (max_offset < relocs[i].offset) max_offset = relocs[i].offset;
   start = (size_t) base / page_size * page_size;
   len = (size_t) base + max_offset + sizeof (void *) - start;
+#if defined(MIR_WIN64_UNWIND)
+  lock_code (ctx);
+#endif
   _MIR_set_code (ctx->code_alloc, start, len, base, nloc, relocs, 0);
   _MIR_flush_code_cache (base, base + max_offset + sizeof (void *));
+#if defined(MIR_WIN64_UNWIND)
+  unlock_code (ctx);
+#endif
 }
 
 void _MIR_update_code (MIR_context_t ctx, uint8_t *base, size_t nloc, ...) { /* thread safe */
@@ -4521,9 +4899,18 @@ void _MIR_update_code (MIR_context_t ctx, uint8_t *base, size_t nloc, ...) { /* 
 }
 
 uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size) {
-  code_holder_t *ch_ptr = get_last_code_holder (ctx, size);
+  code_holder_t *ch_ptr;
+  uint8_t *res;
 
-  return ch_ptr == NULL ? NULL : ch_ptr->free;
+#if defined(MIR_WIN64_UNWIND)
+  lock_code (ctx);
+#endif
+  ch_ptr = get_last_code_holder (ctx, size, 0);
+  res = ch_ptr == NULL ? NULL : ch_ptr->free;
+#if defined(MIR_WIN64_UNWIND)
+  unlock_code (ctx);
+#endif
+  return res;
 }
 
 static void code_init (MIR_context_t ctx) {
@@ -4539,9 +4926,76 @@ static void code_init (MIR_context_t ctx) {
       code_reserve_bound = mem + MIR_CODE_RESERVE_SIZE;
     }
   }
+#if defined(MIR_WIN64_UNWIND)
+  InitializeSRWLock (&code_lock);
+  /* The growable function table API needs Windows 8.  It is used when the whole
+     set is available; otherwise the fixed table API is used for every publish.
+     A missing API is not the same thing as a failing call: the former switches
+     the registration mode, the latter is reported as an error.  */
+  add_growable = NULL;
+  grow_function_table = NULL;
+  delete_growable = NULL;
+  {
+    HMODULE ntdll = GetModuleHandleA ("ntdll.dll");
+
+    if (ntdll != NULL) {
+      add_growable = (rtl_add_growable_func_t) (void (*) (void)) GetProcAddress (
+        ntdll, "RtlAddGrowableFunctionTable");
+      grow_function_table = (rtl_grow_func_t) (void (*) (void)) GetProcAddress (
+        ntdll, "RtlGrowFunctionTable");
+      delete_growable = (rtl_delete_growable_func_t) (void (*) (void)) GetProcAddress (
+        ntdll, "RtlDeleteGrowableFunctionTable");
+      if (add_growable == NULL || grow_function_table == NULL || delete_growable == NULL) {
+        add_growable = NULL;
+        grow_function_table = NULL;
+        delete_growable = NULL;
+      }
+    }
+  }
+#endif
 }
 
 static void code_finish (MIR_context_t ctx) {
+#if defined(MIR_DWARF_UNWIND)
+  /* Unregister the frame information before the code it describes goes away
+     (and before the blocks themselves are freed).  */
+  for (size_t i = 0; i < VARR_LENGTH (code_holder_t, code_holders); i++) {
+    code_holder_t *ch_ptr = VARR_ADDR (code_holder_t, code_holders) + i;
+    struct code_fde_block *fb, *next;
+
+    for (fb = ch_ptr->fde_blocks; fb != NULL; fb = next) {
+      next = fb->next;
+      __deregister_frame (fb->data);
+      MIR_free (ctx->alloc, fb->data);
+      MIR_free (ctx->alloc, fb);
+    }
+    ch_ptr->fde_blocks = NULL;
+  }
+#endif
+#if defined(MIR_WIN64_UNWIND)
+  /* Unregister the unwind tables before the code they describe goes away.  */
+  for (size_t i = 0; i < VARR_LENGTH (code_holder_t, code_holders); i++) {
+    code_holder_t *ch_ptr = VARR_ADDR (code_holder_t, code_holders) + i;
+    struct code_rf_array *fa, *next;
+
+    if (ch_ptr->growable != NULL) {
+      delete_growable (ch_ptr->growable);
+      ch_ptr->growable = NULL;
+    }
+    for (fa = ch_ptr->fallback; fa != NULL; fa = next) {
+      next = fa->next;
+      RtlDeleteFunctionTable ((PRUNTIME_FUNCTION) fa->entries);
+      MIR_free (ctx->alloc, fa->entries);
+      MIR_free (ctx->alloc, fa);
+    }
+    ch_ptr->fallback = NULL;
+    if (ch_ptr->rf != NULL) {
+      MIR_free (ctx->alloc, ch_ptr->rf);
+      ch_ptr->rf = NULL;
+    }
+    ch_ptr->rf_len = ch_ptr->rf_cap = 0;
+  }
+#endif
   while (VARR_LENGTH (code_holder_t, code_holders) != 0) {
     code_holder_t ch = VARR_POP (code_holder_t, code_holders);
     if (code_reserve_start != NULL && ch.start >= code_reserve_start

@@ -16,7 +16,8 @@ if(NOT WIN32)
     $<$<CONFIG:RELEASE>:-O3>
     $<$<CONFIG:RelWithDebInfo>:-O3>
   )
-  add_compile_options(-std=gnu11 -Wno-abi -fsigned-char -fPIC)
+  # gnu11 is a C dialect: it must not leak into the C++ tests
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:-std=gnu11> -Wno-abi -fsigned-char -fPIC)
 endif()
 
 include(CheckCCompilerFlag)
@@ -41,13 +42,30 @@ message("C compiler flags: ${CMAKE_C_FLAGS}")
 option(BUILD_TESTING "" ON)
 include(CTest)
 
+# The target guard of the Linux x86-64 JIT frame information (MIR_DWARF_UNWIND
+# in mir-unwind-target.h): LP64 x86-64 Linux, not x32, not Android, not Apple and
+# not the other Unixes.  One predicate for the dependency and for the tests.
+set(MIR_DWARF_UNWIND_P FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT ANDROID
+   AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+  set(MIR_DWARF_UNWIND_P TRUE)
+endif()
+
 add_library(mir OBJECT mir.c mir-gen.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
 target_include_directories(mir PRIVATE ${PROJECT_SOURCE_DIR})
 if(Threads_FOUND)
   target_compile_definitions(mir PUBLIC "MIR_PARALLEL_GEN")
 endif()
 if(UNIX)
-	target_link_libraries(mir m)
+	target_link_libraries(mir PUBLIC m)
+	# __register_frame/__deregister_frame come from libgcc_s: the dependency has
+	# to reach the static and the shared library as well as every consumer of the
+	# object library.
+	if(MIR_DWARF_UNWIND_P)
+		target_link_libraries(mir PUBLIC gcc_s)
+	endif()
 endif()
 
 # ------------------ LIBMIR -----------------------
@@ -235,6 +253,79 @@ if(WIN32)
   target_link_libraries(win64_abi mir)
 
   add_test(win64-abi-test win64_abi)
+
+  # JIT stack unwinding (Windows x64 unwind information and function tables)
+  add_executable (win64_unwind "mir-tests/win64-unwind.c")
+  target_include_directories(win64_unwind PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(win64_unwind mir)
+
+  add_test(win64-unwind-full win64_unwind full)
+  add_test(win64-unwind-lazy win64_unwind lazy)
+  add_test(win64-unwind-bb win64_unwind bb)
+  add_test(win64-unwind-misc win64_unwind)
+endif()
+
+# ------------------ Linux x86-64 JIT unwinding test ----------------
+
+if(MIR_DWARF_UNWIND_P)
+  add_executable (linux_dwarf_unwind "mir-tests/linux-dwarf-unwind.cpp")
+  target_include_directories(linux_dwarf_unwind PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(linux_dwarf_unwind mir)
+  set_property(TARGET linux_dwarf_unwind PROPERTY CXX_STANDARD 17)
+  set_property(TARGET linux_dwarf_unwind PROPERTY CXX_STANDARD_REQUIRED ON)
+
+  add_test(dwarf-unwind-full linux_dwarf_unwind full)
+  add_test(dwarf-unwind-lazy linux_dwarf_unwind lazy)
+  add_test(dwarf-unwind-bb linux_dwarf_unwind bb)
+  add_test(dwarf-unwind-hook linux_dwarf_unwind hook)
+  add_test(dwarf-unwind-thunk linux_dwarf_unwind thunk)
+  add_test(dwarf-unwind-interp linux_dwarf_unwind interp)
+  add_test(dwarf-unwind-leaf linux_dwarf_unwind leaf)
+  add_test(dwarf-unwind-growth linux_dwarf_unwind growth)
+  add_test(dwarf-unwind-allocator linux_dwarf_unwind allocator)
+  add_test(dwarf-unwind-jret linux_dwarf_unwind jret)
+
+  # The link contract: a pure C host links the shared library without adding
+  # libgcc_s itself (it has to come from the DT_NEEDED entry) and the static
+  # library with the dependency propagated by the target.
+  add_executable (linux_dwarf_host_shared "mir-tests/linux-dwarf-host.c")
+  target_include_directories(linux_dwarf_host_shared PRIVATE ${PROJECT_SOURCE_DIR})
+  # the sources call _Unwind_* themselves; a shared library dependency is not
+  # propagated to the executable link, and gcc only masks that with its implicit
+  # -lgcc_s (clang with --rtlib=compiler-rt does not)
+  target_link_libraries(linux_dwarf_host_shared mir_shared gcc_s)
+  add_test(dwarf-unwind-host-shared linux_dwarf_host_shared)
+
+  add_executable (linux_dwarf_host_static "mir-tests/linux-dwarf-host.c")
+  target_include_directories(linux_dwarf_host_static PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(linux_dwarf_host_static mir_static)
+  add_test(dwarf-unwind-host-static linux_dwarf_host_static)
+
+  # The two host runs above are smoke tests only: gcc appends -lgcc_s to every
+  # executable link, so they would also link and run if the shared library had no
+  # dependency on it.  The dependency itself is what has to be asserted, so it is
+  # read from the artifact.
+  add_test(NAME dwarf-unwind-shared-needed
+           COMMAND sh -c "readelf -d '$<TARGET_FILE:mir_shared>' | grep -q libgcc_s")
+
+  # The plain target paths (macOS, *BSD, x32, Android) are compiled and run here
+  # by disabling the unwind support: this is the only automated check that those
+  # branches build and work, and it is what the "other targets keep the previous
+  # behaviour" requirement rests on.
+  add_executable (plain_unwind "mir-tests/plain-unwind.c")
+  target_include_directories(plain_unwind PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_definitions(plain_unwind PRIVATE MIR_UNWIND_DISABLE)
+  # the library has to be built with the same setting, so it is compiled again
+  add_library(mir_plain OBJECT mir.c mir-gen.c)
+  target_include_directories(mir_plain PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_definitions(mir_plain PRIVATE MIR_UNWIND_DISABLE)
+  target_link_libraries(plain_unwind mir_plain ${CMAKE_DL_LIBS})
+  # the test asserts the absence of any FDE with _Unwind_Find_FDE
+  target_link_libraries(plain_unwind gcc_s)
+  if(Threads_FOUND)
+    target_link_libraries(plain_unwind ${CMAKE_THREAD_LIBS_INIT})
+  endif()
+  add_test(plain-unwind-test plain_unwind)
 endif()
 
 # ------------------ readme example test ----------------

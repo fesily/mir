@@ -683,6 +683,30 @@ extern MIR_item_t _MIR_builtin_func (MIR_context_t ctx, MIR_module_t module, con
                                      void *addr);
 extern void _MIR_flush_code_cache (void *start, void *bound);
 extern uint8_t *_MIR_publish_code (MIR_context_t ctx, const uint8_t *code, size_t code_len);
+/* Windows x64 and Linux x86-64 (JIT): publish code together with unwind
+   information.  Every range is a half-open [begin, end) interval of the
+   published blob; the metadata is copied, the caller need not keep it alive.
+   With N == 0 this is the same as _MIR_publish_code.
+
+   The info contract is target specific: on Windows x64 it is a version 1
+   UNWIND_INFO and a zero length is an error (the runtime has no default rule);
+   on Linux x86-64 it is a DWARF DW_CFA instruction stream which is put into an
+   FDE, and an empty stream is allowed -- it describes the default leaf rules,
+   which libgcc does not apply to JIT code by itself.  The Linux block is
+   registered with __register_frame from libgcc_s.
+
+   The ranges have to be ordered and must not overlap; a range which is empty,
+   ends outside the blob, or has a length but no data is reported through the
+   MIR error handler.  On the targets without unwind support this function
+   publishes without any metadata (the information is simply not used).  */
+struct _MIR_code_unwind {
+  size_t begin, end;
+  const uint8_t *info;
+  size_t info_len;
+};
+extern uint8_t *_MIR_publish_code_with_unwind (MIR_context_t ctx, const uint8_t *code,
+                                               size_t code_len, size_t n,
+                                               const struct _MIR_code_unwind *unwind);
 extern uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size);
 extern uint8_t *_MIR_publish_code_by_addr (MIR_context_t ctx, void *addr, const uint8_t *code,
                                            size_t code_len);
@@ -725,7 +749,25 @@ extern void *_MIR_get_jmpi_thunk (MIR_context_t ctx, void **res_loc, void *res, 
 extern void *_MIR_get_wrapper (MIR_context_t ctx, MIR_item_t called_func, void *hook_address);
 extern void *_MIR_get_wrapper_end (MIR_context_t ctx);
 extern void *_MIR_get_bb_thunk (MIR_context_t ctx, void *bb_version, void *handler);
+/* Windows x64: the bb thunk calls the wrapper (it does not jump into it) and
+   therefore needs the stack adjustment, the inherited unwind rule of the frame
+   the thunk belongs to, and the thunk's own entry state.  */
+extern void *_MIR_get_bb_thunk_win64 (MIR_context_t ctx, void *bb_version, void *handler,
+                                      size_t stack_adjust, const uint8_t *inherited,
+                                      size_t inherited_len, const uint8_t *adjusted,
+                                      size_t adjusted_len);
 extern void _MIR_replace_bb_thunk (MIR_context_t ctx, void *thunk, void *to);
+/* Linux x86-64: the bb thunk reserves the red zone, calls the shared wrapper
+   (so the wrapper has a real return address), releases the reservation and
+   jumps to the bb fragment.  STACK_ADJUST is the reservation size, INHERITED is
+   the frame rule of the enclosing function (empty for a function entry thunk)
+   and ADJUSTED is that rule with the stack adjustment applied.  With
+   DESCRIBE_P == 0 (a jcall/jret continuation) no frame description is
+   registered at all: such a continuation is not a normal call chain.  */
+extern void *_MIR_get_bb_thunk_dwarf (MIR_context_t ctx, void *bb_version, void *handler,
+                                      size_t stack_adjust, int describe_p,
+                                      const uint8_t *inherited, size_t inherited_len,
+                                      const uint8_t *adjusted, size_t adjusted_len);
 extern void *_MIR_get_bb_wrapper (MIR_context_t ctx, void *data, void *hook_address);
 
 extern int _MIR_name_char_p (MIR_context_t ctx, int ch, int first_p);

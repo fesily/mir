@@ -786,3 +786,77 @@ main:	  func
        and constants.  The generation speed on level `1` is about 50% faster than on level `2`
     * `3` means additionally register renaming and loop invariant code motion.  The generation speed
       on level `2` is about 50% faster than on level `3`
+
+## Windows x64 JIT code and stack unwinding
+  * On Windows x64 the generator publishes every generated function, every lazy
+    basic block fragment, and every runtime stub (`_MIR_get_ff_call`,
+    `_MIR_get_interp_shim`, `_MIR_get_wrapper_end`, `_MIR_get_bb_wrapper`, bb
+    thunks) with version 1 `UNWIND_INFO` records, so the system unwinder
+    (structured exception handling, `RtlVirtualUnwind`, stack traces) can walk
+    through generated frames
+  * The tables are preferred to be dynamic function tables
+    (`RtlAddGrowableFunctionTable`/`RtlGrowFunctionTable`, Windows 8 and later,
+    resolved from `ntdll`).  When that API is not available at all the older
+    `RtlAddFunctionTable`/`RtlDeleteFunctionTable` interface is used for every
+    publish.  A *failing* registration is reported through the MIR error handler;
+    it is never silently turned into an unwindable frame
+  * The unwind data belongs to the MIR context code allocator, not to the
+    generator, so generated code stays callable and unwindable after
+    `MIR_gen_finish`.  The tables are unregistered by `MIR_finish` before the
+    code is unmapped: a context (and its JIT code) must not be used or unwound
+    by other threads while it is being destroyed
+  * A function which changes neither RSP nor a non-volatile register is a real
+    leaf and gets no function table entry (the default leaf rule applies)
+  * Frames of `MIR_JCALL`/`MIR_JRET` continuation functions are *not* describable
+    by the Windows calling convention and get no unwind entries: do not expect
+    system exception handling or sampling to cross such a continuation boundary
+  * Windows x64 C `__try`/`__except`/`__finally` syntax is not implemented by
+    `c2mir`; only the unwinding of JIT frames is provided here
+
+## Linux x86-64 JIT code and stack unwinding
+  * On non-Android Linux x86-64 (LP64; x32 and Android, which has no libgcc_s,
+    are not supported by this part) the generator
+    publishes every generated function, every lazy basic block fragment and
+    every runtime stub (`_MIR_get_bstart_builtin`, `_MIR_get_bend_builtin`,
+    `_MIR_get_ff_call`, `_MIR_get_interp_shim`, `_MIR_get_wrapper`,
+    `_MIR_get_wrapper_end`, `_MIR_get_bb_wrapper`, bb thunks) with DWARF call
+    frame information, so the system unwinder of `libgcc_s` and every consumer
+    of it (C++ exceptions, `_Unwind_Backtrace`, sampling profilers) can walk
+    through generated frames.  The encoded information is a `.eh_frame` like
+    block (one CIE with the augmentation `zR`, one FDE per described range, and
+    the zero terminator) registered with `__register_frame`.  The block belongs
+    to the code holder (it is not adjacent to the code) and is unregistered by
+    `__deregister_frame` in `MIR_finish` before the code is unmapped, so
+    generated code stays callable and unwindable after `MIR_gen_finish`.  A
+    context (and its JIT code) must not be used or unwound by other threads while
+    it is being destroyed
+  * Only `rax`, `rdx`, `rcx`, `rbx`, `rsi`, `rdi`, `rbp`, `rsp`, `r8`..`r15` and
+    the XMM registers are mapped (`mir_dwarf_cfi_reg`); the SysV non-volatile
+    registers are described relative to the CFA, so the rules stay valid while
+    the CFA moves
+  * Every frame rule row is at an *instruction end*: the addresses are the
+    return PCs the unwinder looks up after subtracting one.  The rows are
+    emitted after the branch lengths and the alignment of the code are final
+  * A function which changes neither RSP nor a non-volatile register is a real
+    leaf, but it *does* get a minimal FDE with an empty instruction stream: the
+    CIE default rules are the same as the Windows default leaf rule, yet libgcc
+    does not apply any default rule to code without an FDE
+  * `alloca` changes RSP dynamically and forces a frame register, so the frame
+    is described through it.  The inline `bstart`/`bend` are value preserving
+    (they restore the same RSP) and need no rule of their own; the runtime
+    `bstart`/`bend` stubs are described only until the stack switch (a switch is
+    not a describable frame transformation)
+  * The shared bb wrapper is *called* by the bb thunk (it does not get a tail
+    jump), so it has a real return address and a frame of its own; the thunk
+    reserves the 128 bytes of the red zone of the enclosing frame before the
+    call (`mir-tests/linux-dwarf-unwind.cpp` checks that the red zone survives)
+  * Frames of `MIR_JCALL`/`MIR_JRET` continuation functions are not part of the
+    standard call chain and get no FDE: do not expect system exception handling
+    or sampling to cross such a continuation boundary
+  * An ABI without a red zone is not supported by this part of the generator:
+    `MIR_NO_RED_ZONE_ABI` together with the Linux x86-64 frame information is a
+    compile time error (`#error`), not a silent degradation
+  * Untranslated C++ exception handling inside MIR (`try`/`catch` in MIR IR,
+    personalities, LSDA) and `c2mir` support for C++ are *not* provided: the
+    unwinding of JIT frames only lets an exception of the host pass through the
+    generated code.  The generated code has no cleanup semantics of its own

@@ -113,6 +113,10 @@ static void varr_error (const char *message) { util_error (NULL, message); }
 #include "mir-hash.h"
 #include "mir-gen.h"
 
+/* MIR_WIN64_UNWIND and MIR_DWARF_UNWIND are defined by the included target
+   file (see #include "mir-gen-x86_64.c" below): the seams use them only after
+   the include, so there is exactly one definition of the target guards.  */
+
 /* Functions used by target dependent code: */
 static MIR_alloc_t gen_alloc (gen_ctx_t gen_ctx);
 static void *gen_malloc (gen_ctx_t gen_ctx, size_t size);
@@ -9539,7 +9543,14 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
   });
   if (machine_code_p) {
     code = target_translate (gen_ctx, &code_len);
+#if defined(MIR_WIN64_UNWIND)
+    machine_code = func_item->u.func->call_addr
+      = target_win64_publish (gen_ctx, func_item, code, code_len, 0);
+#elif defined(MIR_DWARF_UNWIND)
+    machine_code = func_item->u.func->call_addr = target_dwarf_publish (gen_ctx, code, code_len);
+#else
     machine_code = func_item->u.func->call_addr = _MIR_publish_code (ctx, code, code_len);
+#endif
     target_rebase (gen_ctx, func_item->u.func->call_addr);
 #if MIR_GEN_CALL_TRACE
     func_item->u.func->call_addr = _MIR_get_wrapper (ctx, func_item, print_and_execute_wrapper);
@@ -9608,8 +9619,10 @@ static void *bb_version_generator (gen_ctx_t gen_ctx, bb_version_t bb_version);
 
 static bb_version_t get_bb_version (gen_ctx_t gen_ctx, bb_stub_t bb_stub, uint32_t n_attrs,
                                     spot_attr_t *attrs, int call_p, void **addr) {
-  MIR_context_t ctx = gen_ctx->ctx;
   bb_version_t bb_version;
+#if !defined(MIR_WIN64_UNWIND) && !defined(MIR_DWARF_UNWIND)
+  MIR_context_t ctx = gen_ctx->ctx;
+#endif
 
   if ((bb_version = DLIST_HEAD (bb_version_t, bb_stub->bb_versions)) != NULL) {
     VARR_PUSH (target_bb_version_t, target_succ_bb_versions, NULL);
@@ -9628,7 +9641,19 @@ static bb_version_t get_bb_version (gen_ctx_t gen_ctx, bb_stub_t bb_stub, uint32
   bb_version->call_p = call_p;
   DLIST_APPEND (bb_version_t, bb_stub->bb_versions, bb_version);
   bb_version->machine_code = NULL;
+#if defined(MIR_WIN64_UNWIND)
+  *addr = bb_version->addr
+    = target_win64_get_bb_thunk (
+      gen_ctx, bb_stub->func_item, bb_version, bb_wrapper,
+      bb_stub == (bb_stub_t) bb_stub->func_item->data ? TRUE : FALSE);
+#elif defined(MIR_DWARF_UNWIND)
+  *addr = bb_version->addr
+    = target_dwarf_get_bb_thunk (
+      gen_ctx, bb_stub->func_item, bb_version, bb_wrapper,
+      bb_stub == (bb_stub_t) bb_stub->func_item->data ? TRUE : FALSE);
+#else
   *addr = bb_version->addr = _MIR_get_bb_thunk (ctx, bb_version, bb_wrapper);
+#endif
   return bb_version;
 }
 
@@ -9900,6 +9925,12 @@ static void generate_bb_version_machine_code (gen_ctx_t gen_ctx, bb_version_t bb
   DEBUG (2, { fprintf (debug_file, "\n"); });
   if (bb_version->n_attrs != 0) max_spot = bb_version->attrs[bb_version->n_attrs - 1].spot;
   VARR_TRUNC (target_bb_version_t, target_succ_bb_versions, 0);
+#if defined(MIR_DWARF_UNWIND)
+  /* The entry fragment starts at the function head (it repeats the prologue);
+     any other fragment starts in the middle of the frame.  */
+  target_dwarf_bb_start (gen_ctx, bb_stub->func_item,
+                         bb_stub == (bb_stub_t) bb_stub->func_item->data ? 1 : 2);
+#endif
   target_bb_translate_start (gen_ctx);
   for (curr_insn = bb_stub->first_insn;; curr_insn = next_insn) {
     next_insn = DLIST_NEXT (MIR_insn_t, curr_insn);
@@ -10045,7 +10076,14 @@ static void generate_bb_version_machine_code (gen_ctx_t gen_ctx, bb_version_t bb
     target_output_jump (gen_ctx, VARR_ADDR (void_ptr_t, succ_bb_addrs));
   }
   code = target_bb_translate_finish (gen_ctx, &code_len);
+#if defined(MIR_WIN64_UNWIND)
+  addr = target_win64_publish (gen_ctx, bb_stub->func_item, code, code_len,
+                               bb_stub == (bb_stub_t) bb_stub->func_item->data ? 1 : 2);
+#elif defined(MIR_DWARF_UNWIND)
+  addr = target_dwarf_publish (gen_ctx, code, code_len);
+#else
   addr = _MIR_publish_code (ctx, code, code_len);
+#endif
   target_bb_rebase (gen_ctx, addr);
   target_setup_succ_bb_version_data (gen_ctx, addr);
   DEBUG (1, {

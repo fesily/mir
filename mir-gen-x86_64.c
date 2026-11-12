@@ -5,6 +5,84 @@
 #include <limits.h>
 
 #include "mir-x86_64.h"
+#include "mir-unwind-target.h"
+
+#if defined(MIR_WIN64_UNWIND)
+#include "mir-win64-unwind.h"
+
+/* Unspec insn codes used only to emit the Windows x64 frame pointer push/pop
+   with their exact one-byte encoding (a plain MOV store can not be described by
+   unwind codes).  */
+#define PUSH_RBP_CODE 1
+#define POP_RBP_CODE 2
+
+/* A prologue operation whose machine code offset is not known before the
+   translation.  The operations are collected in the prologue emission order.  */
+enum {
+  WINOP_PUSH,
+  WINOP_ALLOC,
+  WINOP_SET_FPREG,
+  WINOP_SAVE_GPR,
+  WINOP_SAVE_XMM
+};
+
+typedef struct target_prolog_op target_prolog_op_t;
+
+struct target_prolog_op {
+  MIR_insn_t insn;
+  uint8_t kind, reg;
+  uint32_t value;
+};
+
+DEF_VARR (target_prolog_op_t);
+
+/* The immutable unwind description of a generated function: it outlives the
+   code generation of the function because lazy bb fragments and bb thunks of
+   the function are generated later.  */
+struct target_frame_desc {
+  MIR_item_t func_item;
+  uint8_t *real_info, *inherit_info, *b32_info, *b40_info;
+  size_t real_len, inherit_len, b32_len, b40_len;
+  int has_frame_p;
+  struct target_frame_desc *next;
+};
+#endif
+
+/* Linux x86-64 (JIT): the same idea with DWARF call frame information.  The
+   SysV prologue/epilogue events are collected with their MIR insn anchors and
+   their CFA relative values, the machine code offsets are filled in when the
+   instructions are translated (so branch length selection and alignment are
+   already final), and every row is at an instruction end -- the address libgcc
+   looks up after subtracting one from the return PC.  */
+#if defined(MIR_DWARF_UNWIND)
+#include "mir-dwarf-cfi.h"
+
+enum { DWOP_OFFSET, DWOP_DEF_CFA, DWOP_RESTORE };
+typedef struct target_cfi_event target_cfi_event_t;
+
+struct target_cfi_event {
+  MIR_insn_t insn; /* the insn whose machine code end is the row address */
+  uint8_t kind, reg;
+  int64_t value; /* DWOP_OFFSET: the CFA relative displacement, otherwise the offset */
+};
+
+DEF_VARR (target_cfi_event_t);
+
+/* The immutable frame description of a generated function (see the Windows
+   variant above for why it can not belong to the code generation).  */
+struct target_dwarf_frame_desc {
+  MIR_item_t func_item;
+  target_cfi_event_t *events;
+  size_t n_events;
+  size_t n_prolog;    /* the events of the prologue: events [0, n_prolog) */
+  uint8_t *body_info; /* the rules after the prologue, no code offsets */
+  size_t body_len;
+  uint8_t cfa_reg;    /* the CFA rule of the body */
+  uint64_t cfa_off;
+  int has_frame_p; /* 0 = a real leaf: no prologue, so the entry rules are the body rules */
+  struct target_dwarf_frame_desc *next;
+};
+#endif
 
 static const MIR_reg_t FP_HARD_REG = BP_HARD_REG;
 
@@ -654,6 +732,28 @@ struct target_ctx {
   VARR (uint64_t) * abs_address_locs;
   VARR (MIR_code_reloc_t) * relocs;
   VARR (call_ref_t) * call_refs;
+#if defined(MIR_WIN64_UNWIND)
+  VARR (target_prolog_op_t) * prolog_ops; /* prologue ops of the current function */
+  size_t prolog_op_cursor;
+  struct mir_win64_unwind_builder unwind_builder;
+  size_t exec_end; /* end of the executable code of the last translation */
+  int unwind_present_p;
+  int continuation_p; /* a jcall/jret function: no unwind tables at all */
+  struct target_frame_desc *frame_descs;
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  VARR (target_cfi_event_t) * cfi_events; /* prologue and epilogue events */
+  size_t cfi_n_prolog;
+  size_t cfi_event_cursor;
+  size_t cfi_row_off; /* the address of the last emitted row */
+  size_t dwarf_exec_end;
+  struct target_dwarf_frame_desc *dwarf_descs;
+  struct target_dwarf_frame_desc *dwarf_cur_desc;
+  VARR (uint8_t) * cfi_stream, *cfi_work;
+  uint8_t dwarf_cfa_reg;
+  uint64_t dwarf_cfa_off;
+  int dwarf_cfi_p;
+#endif
 };
 
 #define alloca_p gen_ctx->target_ctx->alloca_p
@@ -672,6 +772,29 @@ struct target_ctx {
 #define label_refs gen_ctx->target_ctx->label_refs
 #define abs_address_locs gen_ctx->target_ctx->abs_address_locs
 #define relocs gen_ctx->target_ctx->relocs
+#if defined(MIR_WIN64_UNWIND)
+#define prolog_ops gen_ctx->target_ctx->prolog_ops
+#define prolog_op_cursor gen_ctx->target_ctx->prolog_op_cursor
+#define unwind_builder gen_ctx->target_ctx->unwind_builder
+#define exec_end gen_ctx->target_ctx->exec_end
+#define unwind_present_p gen_ctx->target_ctx->unwind_present_p
+#define continuation_p gen_ctx->target_ctx->continuation_p
+#define frame_descs gen_ctx->target_ctx->frame_descs
+#endif
+#if defined(MIR_DWARF_UNWIND)
+#define cfi_events gen_ctx->target_ctx->cfi_events
+#define cfi_n_prolog gen_ctx->target_ctx->cfi_n_prolog
+#define cfi_event_cursor gen_ctx->target_ctx->cfi_event_cursor
+#define cfi_row_off gen_ctx->target_ctx->cfi_row_off
+#define dwarf_exec_end gen_ctx->target_ctx->dwarf_exec_end
+#define dwarf_descs gen_ctx->target_ctx->dwarf_descs
+#define dwarf_cur_desc gen_ctx->target_ctx->dwarf_cur_desc
+#define cfi_stream gen_ctx->target_ctx->cfi_stream
+#define cfi_work gen_ctx->target_ctx->cfi_work
+#define dwarf_cfa_reg gen_ctx->target_ctx->dwarf_cfa_reg
+#define dwarf_cfa_off gen_ctx->target_ctx->dwarf_cfa_off
+#define dwarf_cfi_p gen_ctx->target_ctx->dwarf_cfi_p
+#endif
 
 static void prohibit_omitting_fp (gen_ctx_t gen_ctx) { keep_fp_p = TRUE; }
 
@@ -1181,6 +1304,263 @@ static void dsave (gen_ctx_t gen_ctx, MIR_insn_t anchor, int disp, MIR_reg_t har
            _MIR_new_var_op (ctx, hard_reg));
 }
 
+#if defined(MIR_DWARF_UNWIND) && defined(MIR_NO_RED_ZONE_ABI)
+#error "the SysV DWARF CFI does not describe the MIR_NO_RED_ZONE_ABI prologue/epilogue yet"
+#endif
+
+#if defined(MIR_DWARF_UNWIND)
+static void dwarf_create_frame_desc (gen_ctx_t gen_ctx, MIR_item_t func_item, int has_frame_p);
+static void dwarf_translate_start (gen_ctx_t gen_ctx, MIR_item_t func_item, int kind);
+static void dwarf_translate_record (gen_ctx_t gen_ctx, MIR_insn_t insn);
+
+/* Remember a frame rule event of the instruction INSN (which is about to be
+   translated): KIND is DWOP_*, MIR_REG the MIR hard register and VALUE the CFA
+   relative displacement (DWOP_OFFSET) or the CFA offset (DWOP_DEF_CFA).  */
+static void dwarf_record_cfi (gen_ctx_t gen_ctx, MIR_insn_t insn, int kind, MIR_reg_t mir_reg,
+                              int64_t value) {
+  target_cfi_event_t ev;
+
+  ev.insn = insn;
+  ev.kind = (uint8_t) kind;
+  ev.reg = (uint8_t) mir_dwarf_cfi_reg ((unsigned) mir_reg);
+  ev.value = value;
+  VARR_PUSH (target_cfi_event_t, cfi_events, ev);
+}
+#endif
+
+#if defined(MIR_WIN64_UNWIND)
+/* Windows x64 prologue/epilogue.  The frame pointer (when the function needs
+   one) is established the way the Windows unwinder expects:
+
+     push rbp
+     sub  rsp,<frame_alloc>          ; 16-byte aligned, might be absent
+     lea  rbp,[rsp+F]                ; F = min(frame_alloc rounded, 240)
+
+   so the frame base (RBP - F) is the fixed bottom of the frame and the saved
+   non-volatile registers are described by offsets from it.  All frame-relative
+   displacements of the function body are rebased with BIAS = frame_alloc - F
+   before the prologue is inserted, which keeps every address (incoming stack
+   arguments, varargs/va_start areas, spills, block arguments) unchanged.  */
+
+static void win64_create_frame_desc (gen_ctx_t gen_ctx, MIR_item_t func_item, int has_frame_p);
+
+static void win64_record_op (gen_ctx_t gen_ctx, MIR_insn_t insn, int kind, int reg,
+                             uint32_t value) {
+  target_prolog_op_t op;
+
+  op.insn = insn;
+  op.kind = (uint8_t) kind;
+  op.reg = (uint8_t) reg;
+  op.value = value;
+  VARR_PUSH (target_prolog_op_t, prolog_ops, op);
+}
+
+/* Add BIAS to every frame pointer relative address of the (already register
+   allocated) function body.  Only the old logical frame pointer uses are
+   handled: the new prologue/epilogue insns are inserted afterwards.  */
+static void win64_rebase_fp_uses (gen_ctx_t gen_ctx, int64_t bias) {
+  MIR_insn_t insn;
+  size_t i;
+
+  if (bias == 0) return;
+  for (insn = DLIST_HEAD (MIR_insn_t, curr_func_item->u.func->insns); insn != NULL;
+       insn = DLIST_NEXT (MIR_insn_t, insn)) {
+    for (i = 0; i < insn->nops; i++) {
+      MIR_op_t *op = &insn->ops[i];
+
+      if (op->mode == MIR_OP_VAR_MEM && op->u.var_mem.base == FP_HARD_REG)
+        op->u.var_mem.disp += bias;
+    }
+    if ((insn->code == MIR_ADD || insn->code == MIR_SUB) && insn->nops == 3
+        && insn->ops[1].mode == MIR_OP_VAR && insn->ops[1].u.var == FP_HARD_REG
+        && (insn->ops[2].mode == MIR_OP_INT || insn->ops[2].mode == MIR_OP_UINT))
+      insn->ops[2].u.i += (insn->code == MIR_SUB ? -bias : bias);
+  }
+}
+
+/* Record the unwind operation of the prologue insn INSN which has just been
+   translated to the code ending at the current output offset.  */
+static void win64_translate_record (gen_ctx_t gen_ctx, MIR_insn_t insn) {
+  size_t off = VARR_LENGTH (uint8_t, result_code);
+
+  while (prolog_op_cursor < VARR_LENGTH (target_prolog_op_t, prolog_ops)) {
+    target_prolog_op_t *op = &VARR_ADDR (target_prolog_op_t, prolog_ops)[prolog_op_cursor];
+
+    if (op->insn != insn) break;
+    if (off > 255) { /* the format can not describe such a long prologue */
+      unwind_builder.bad_p = 1;
+      off = 255;
+    }
+    switch (op->kind) {
+    case WINOP_PUSH: mir_win64_unwind_push_nonvol (&unwind_builder, (uint8_t) off, op->reg); break;
+    case WINOP_ALLOC:
+      mir_win64_unwind_alloc (&unwind_builder, (uint8_t) off, op->value);
+      break;
+    case WINOP_SET_FPREG: mir_win64_unwind_set_fpreg (&unwind_builder, (uint8_t) off); break;
+    case WINOP_SAVE_GPR:
+      mir_win64_unwind_save_nonvol (&unwind_builder, (uint8_t) off, op->reg, op->value);
+      break;
+    case WINOP_SAVE_XMM:
+      mir_win64_unwind_save_xmm128 (&unwind_builder, (uint8_t) off, op->reg, op->value);
+      break;
+    default: break;
+    }
+    prolog_op_cursor++;
+  }
+}
+
+static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_regs,
+                                       size_t stack_slots_num) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  MIR_func_t func;
+  MIR_insn_t anchor, new_insn;
+  MIR_op_t sp_reg_op, fp_reg_op;
+  MIR_reg_t base_reg;
+  int64_t offset, bias = 0, frame_base = 0;
+  size_t i, service_area_size, saved_hard_regs_size, stack_slots_size, block_size, frame_alloc = 0,
+                                                                              frame_offset = 0;
+
+  assert (curr_func_item->item_type == MIR_func_item);
+  func = curr_func_item->u.func;
+  for (i = saved_hard_regs_size = 0; i <= R15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i))
+      saved_hard_regs_size += 8;
+  for (; i <= XMM15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i))
+      saved_hard_regs_size += 16;
+  VARR_TRUNC (target_prolog_op_t, prolog_ops, 0);
+  mir_win64_unwind_init (&unwind_builder);
+  unwind_present_p = FALSE;
+  /* A jcall/jret continuation has no return address on its entry stack, so its
+     frame can not be described by the Windows calling convention at all: it is
+     generated as before but gets no function table entries and no frame
+     description (see also target_win64_get_bb_thunk).  */
+  continuation_p = func->jret_p != 0;
+  if (leaf_p && !alloca_p && !block_arg_func_p && saved_hard_regs_size == 0 && !func->vararg_p
+      && stack_slots_num == 0) {
+    /* a real leaf: nothing changes RSP, so no unwind info is needed */
+    if (!continuation_p) win64_create_frame_desc (gen_ctx, curr_func_item, 0);
+    return;
+  }
+  unwind_present_p = !continuation_p;
+  anchor = DLIST_HEAD (MIR_insn_t, func->insns);
+  sp_reg_op = _MIR_new_var_op (ctx, SP_HARD_REG);
+  fp_reg_op = _MIR_new_var_op (ctx, FP_HARD_REG);
+  service_area_size = func->vararg_p ? reg_save_area_size : 0;
+  if (!func->jret_p) service_area_size += 8;
+  stack_slots_size = stack_slots_num * 8;
+  if (!keep_fp_p) stack_slots_size = (stack_slots_size + 15) / 16 * 16;
+  block_size = (stack_slots_size + saved_hard_regs_size + 15) / 16 * 16;
+  if (keep_fp_p) {
+    /* PUSH %rbp already gives the 8 bytes which keep the calls 16-byte aligned
+       for normal functions; a jcall/jret function has no return address on the
+       entry stack, so its allocation must be 8 modulo 16.  */
+    frame_alloc = block_size + (func->jret_p ? 8 : 0);
+    frame_offset = block_size < 240 ? block_size : 240;
+    bias = (int64_t) frame_alloc - (int64_t) frame_offset;
+    frame_base = (int64_t) frame_offset;
+    win64_rebase_fp_uses (gen_ctx, bias);
+    new_insn = _MIR_new_unspec_insn (ctx, 2, MIR_new_int_op (ctx, PUSH_RBP_CODE), fp_reg_op);
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* push %rbp */
+    win64_record_op (gen_ctx, new_insn, WINOP_PUSH, MIR_UNWREG_RBP, 0);
+    if (frame_alloc != 0) {
+      new_insn = MIR_new_insn (ctx, MIR_SUB, sp_reg_op, sp_reg_op,
+                               MIR_new_int_op (ctx, (int64_t) frame_alloc));
+      gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp -= frame_alloc */
+      win64_record_op (gen_ctx, new_insn, WINOP_ALLOC, 0, (uint32_t) frame_alloc);
+    }
+    new_insn = MIR_new_insn (ctx, MIR_ADD, fp_reg_op, sp_reg_op,
+                             MIR_new_int_op (ctx, (int64_t) frame_offset));
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* bp = sp + frame_offset */
+    win64_record_op (gen_ctx, new_insn, WINOP_SET_FPREG, 0, (uint32_t) frame_offset);
+    mir_win64_unwind_set_frame_reg (&unwind_builder, MIR_UNWREG_RBP, (uint32_t) frame_offset);
+    if (func->vararg_p) { /* the argument registers stay in the caller home area */
+      for (i = 0, offset = 16 + bias; i < 4; i++, offset += 8)
+        gen_mov (gen_ctx, anchor, MIR_MOV,
+                 _MIR_new_var_mem_op (ctx, MIR_T_I64, offset, FP_HARD_REG, MIR_NON_VAR, 1),
+                 _MIR_new_var_op (ctx, get_int_arg_reg (i)));
+    }
+    base_reg = FP_HARD_REG;
+    offset = -frame_base;
+  } else {
+    new_insn = MIR_new_insn (ctx, MIR_SUB, sp_reg_op, sp_reg_op,
+                             MIR_new_int_op (ctx, (int64_t) (block_size + service_area_size)));
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp -= block + service area */
+    win64_record_op (gen_ctx, new_insn, WINOP_ALLOC, 0,
+                     (uint32_t) (block_size + service_area_size));
+    base_reg = SP_HARD_REG;
+    offset = (int64_t) stack_slots_size;
+  }
+  /* Saving the callee saved hard registers (XMM are saved first, by 16 bytes): */
+  for (i = XMM0_HARD_REG; i <= XMM15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i)) {
+      new_insn = _MIR_new_unspec_insn (ctx, 3, MIR_new_int_op (ctx, MOVDQA_CODE),
+                                       _MIR_new_var_mem_op (ctx, MIR_T_D, offset, base_reg,
+                                                            MIR_NON_VAR, 1),
+                                       _MIR_new_var_op (ctx, (MIR_reg_t) i));
+      gen_add_insn_before (gen_ctx, anchor, new_insn); /* disp(base) = saved hard reg */
+      win64_record_op (gen_ctx, new_insn, WINOP_SAVE_XMM, (int) (i - XMM0_HARD_REG),
+                       (uint32_t) (offset + frame_base));
+      offset += 16;
+    }
+  for (i = 0; i <= R15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i)) {
+      new_insn
+        = MIR_new_insn (ctx, MIR_MOV,
+                        _MIR_new_var_mem_op (ctx, MIR_T_I64, offset, base_reg, MIR_NON_VAR, 1),
+                        _MIR_new_var_op (ctx, (MIR_reg_t) i));
+      gen_add_insn_before (gen_ctx, anchor, new_insn); /* disp(base) = saved hard reg */
+      win64_record_op (gen_ctx, new_insn, WINOP_SAVE_GPR, (int) i,
+                       (uint32_t) (offset + frame_base));
+      offset += 8;
+    }
+  /* The unwind operations of the prologue are complete now: remember the frame
+     rule for the lazy bb fragments and bb thunks of this function.  */
+  if (!continuation_p) win64_create_frame_desc (gen_ctx, curr_func_item, 1);
+  /* Epilogue: */
+  for (anchor = DLIST_TAIL (MIR_insn_t, func->insns); anchor != NULL;
+       anchor = DLIST_PREV (MIR_insn_t, anchor))
+    if (anchor->code == MIR_RET || anchor->code == MIR_JRET) break;
+  if (anchor == NULL) return;
+  /* Restoring hard registers: */
+  offset = keep_fp_p ? -frame_base : (int64_t) stack_slots_size;
+  for (i = XMM0_HARD_REG; i <= XMM15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i)) {
+      new_insn = _MIR_new_unspec_insn (ctx, 3, MIR_new_int_op (ctx, MOVDQA_CODE),
+                                       _MIR_new_var_op (ctx, (MIR_reg_t) i),
+                                       _MIR_new_var_mem_op (ctx, MIR_T_D, offset, base_reg,
+                                                            MIR_NON_VAR, 1));
+      gen_add_insn_before (gen_ctx, anchor, new_insn); /* hard reg = disp(base) */
+      offset += 16;
+    }
+  for (i = 0; i <= R15_HARD_REG; i++)
+    if (!target_call_used_hard_reg_p ((MIR_reg_t) i, MIR_T_UNDEF)
+        && bitmap_bit_p (used_hard_regs, i)) {
+      new_insn
+        = MIR_new_insn (ctx, MIR_MOV, _MIR_new_var_op (ctx, (MIR_reg_t) i),
+                        _MIR_new_var_mem_op (ctx, MIR_T_I64, offset, base_reg, MIR_NON_VAR, 1));
+      gen_add_insn_before (gen_ctx, anchor, new_insn); /* hard reg = disp(base) */
+      offset += 8;
+    }
+  /* The strict mirror of the prologue: no instruction which is not described by
+     the unwind codes may follow the stack release.  */
+  if (keep_fp_p) {
+    new_insn = MIR_new_insn (ctx, MIR_ADD, sp_reg_op, fp_reg_op, MIR_new_int_op (ctx, bias));
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp = bp + bias (lea) */
+    new_insn = _MIR_new_unspec_insn (ctx, 2, MIR_new_int_op (ctx, POP_RBP_CODE), fp_reg_op);
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* pop %rbp */
+  } else {
+    new_insn = MIR_new_insn (ctx, MIR_ADD, sp_reg_op, sp_reg_op,
+                             MIR_new_int_op (ctx, (int64_t) (block_size + service_area_size)));
+    gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp += block + service area */
+  }
+}
+#else
 static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_regs,
                                        size_t stack_slots_num) {
   MIR_context_t ctx = gen_ctx->ctx;
@@ -1206,9 +1586,19 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
         && bitmap_bit_p (used_hard_regs, i))
       saved_hard_regs_size += 16;
 #endif
+#if defined(MIR_DWARF_UNWIND)
+  VARR_TRUNC (target_cfi_event_t, cfi_events, 0);
+  cfi_n_prolog = 0;
+#endif
   if (leaf_p && !alloca_p && !block_arg_func_p && saved_hard_regs_size == 0 && !func->vararg_p
-      && stack_slots_num == 0)
+      && stack_slots_num == 0) {
+#if defined(MIR_DWARF_UNWIND)
+    /* A real leaf changes neither RSP nor a non-volatile register, but libgcc
+       has no default rule for JIT code: its range gets a minimal description. */
+    if (!func->jret_p) dwarf_create_frame_desc (gen_ctx, curr_func_item, 0);
+#endif
     return;
+  }
   anchor = DLIST_HEAD (MIR_insn_t, func->insns);
   sp_reg_op = _MIR_new_var_op (ctx, SP_HARD_REG);
   if (keep_fp_p) {
@@ -1225,9 +1615,20 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
                              _MIR_new_var_mem_op (ctx, MIR_T_I64, -8, SP_HARD_REG, MIR_NON_VAR, 1),
                              fp_reg_op);
     gen_add_insn_before (gen_ctx, anchor, new_insn); /* -8(sp) = bp */
+#if defined(MIR_DWARF_UNWIND)
+    /* The caller RBP is stored at CFA-16; the CFA still is RSP+8 here.  */
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_OFFSET, FP_HARD_REG, -16);
+#endif
     /* Use add for matching LEA: */
     new_insn = MIR_new_insn (ctx, MIR_ADD, fp_reg_op, sp_reg_op, MIR_new_int_op (ctx, -8));
     gen_add_insn_before (gen_ctx, anchor, new_insn); /* bp = sp - 8 */
+#if defined(MIR_DWARF_UNWIND)
+    /* From here on (including the dynamic allocation of alloca) the frame is
+       described through the stable frame register.  Inline bstart/bend need no
+       rule of their own: they restore the same RSP value (a stack switch is a
+       different case and is not described at all).  */
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_DEF_CFA, FP_HARD_REG, 16);
+#endif
 #endif
   }
 #ifdef _WIN32
@@ -1248,6 +1649,13 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
   new_insn = MIR_new_insn (ctx, MIR_SUB, sp_reg_op, sp_reg_op,
                            MIR_new_int_op (ctx, block_size + service_area_size));
   gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp -= block size + service_area_size */
+#if defined(MIR_DWARF_UNWIND)
+  /* Without a frame register the CFA stays RSP based; the return address is at
+     CFA-8, which is 8 + the allocation above the current RSP.  */
+  if (!keep_fp_p)
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_DEF_CFA, SP_HARD_REG,
+                      (int64_t) (8 + block_size + service_area_size));
+#endif
   bp_saved_reg_offset = block_size;
 #ifdef MIR_NO_RED_ZONE_ABI
   if (keep_fp_p) {
@@ -1304,13 +1712,29 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
                         _MIR_new_var_mem_op (ctx, MIR_T_I64, offset, base_reg, MIR_NON_VAR, 1),
                         _MIR_new_var_op (ctx, (MIR_reg_t) i));
       gen_add_insn_before (gen_ctx, anchor, new_insn); /* disp(bp|sp) = saved hard reg */
+#if defined(MIR_DWARF_UNWIND)
+      /* The store is at CFAB - 16 for the frame register form (CFAB = rbp) and
+         at RSP + stack_slots ... for the RSP form (CFA = RSP + 8 + the
+         allocation): both are fixed CFA relative addresses.  */
+      dwarf_record_cfi (gen_ctx, new_insn, DWOP_OFFSET, (MIR_reg_t) i,
+                        keep_fp_p ? offset - 16
+                                  : offset - (int64_t) (8 + block_size + service_area_size));
+#endif
       offset += 8;
     }
   /* Epilogue: */
+#if defined(MIR_DWARF_UNWIND)
+  cfi_n_prolog = VARR_LENGTH (target_cfi_event_t, cfi_events);
+#endif
   for (anchor = DLIST_TAIL (MIR_insn_t, func->insns); anchor != NULL;
        anchor = DLIST_PREV (MIR_insn_t, anchor))
     if (anchor->code == MIR_RET || anchor->code == MIR_JRET) break;
-  if (anchor == NULL) return;
+  if (anchor == NULL) {
+#if defined(MIR_DWARF_UNWIND)
+    if (!func->jret_p) dwarf_create_frame_desc (gen_ctx, curr_func_item, 1);
+#endif
+    return;
+  }
   /* Restoring hard registers: */
   offset = keep_fp_p ? -bp_saved_reg_offset : (int64_t) stack_slots_size;
 #ifdef _WIN32
@@ -1332,12 +1756,20 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
         = MIR_new_insn (ctx, MIR_MOV, _MIR_new_var_op (ctx, (MIR_reg_t) i),
                         _MIR_new_var_mem_op (ctx, MIR_T_I64, offset, base_reg, MIR_NON_VAR, 1));
       gen_add_insn_before (gen_ctx, anchor, new_insn); /* hard reg = disp(bp|sp) */
+#if defined(MIR_DWARF_UNWIND)
+      /* The caller value is back in the register: its rule is the entry one
+         again and the lifetime of its slot ends here.  */
+      dwarf_record_cfi (gen_ctx, new_insn, DWOP_RESTORE, (MIR_reg_t) i, 0);
+#endif
       offset += 8;
     }
   if (!keep_fp_p) {
     new_insn = MIR_new_insn (ctx, MIR_ADD, sp_reg_op, sp_reg_op,
                              MIR_new_int_op (ctx, block_size + service_area_size));
     gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp += block size + service_area_size */
+#if defined(MIR_DWARF_UNWIND)
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_DEF_CFA, SP_HARD_REG, 8);
+#endif
   } else {
 #ifdef MIR_NO_RED_ZONE_ABI
     new_insn = MIR_new_insn (ctx, MIR_MOV, temp_reg_op, fp_reg_op);
@@ -1351,12 +1783,24 @@ static void target_make_prolog_epilog (gen_ctx_t gen_ctx, bitmap_t used_hard_reg
 #else
     new_insn = MIR_new_insn (ctx, MIR_ADD, sp_reg_op, fp_reg_op, MIR_new_int_op (ctx, 8));
     gen_add_insn_before (gen_ctx, anchor, new_insn); /* sp = bp + 8 */
+#if defined(MIR_DWARF_UNWIND)
+    /* RBP is not restored yet, but the frame is (RBP+16) = (RSP+8) from here
+       on: the rule must not depend on RBP when the load restores it.  */
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_DEF_CFA, SP_HARD_REG, 8);
+#endif
     new_insn = MIR_new_insn (ctx, MIR_MOV, fp_reg_op,
                              _MIR_new_var_mem_op (ctx, MIR_T_I64, -8, SP_HARD_REG, MIR_NON_VAR, 1));
     gen_add_insn_before (gen_ctx, anchor, new_insn); /* bp = -8(sp) */
+#if defined(MIR_DWARF_UNWIND)
+    dwarf_record_cfi (gen_ctx, new_insn, DWOP_RESTORE, FP_HARD_REG, 0);
+#endif
 #endif
   }
+#if defined(MIR_DWARF_UNWIND)
+  if (!func->jret_p) dwarf_create_frame_desc (gen_ctx, curr_func_item, 1);
+#endif
 }
+#endif
 
 struct pattern {
   const MIR_insn_code_t code;
@@ -1647,6 +2091,10 @@ static struct pattern patterns[] = {
   {MIR_UNSPEC, "c" STR_VAL (MOVDQA_CODE) " r r", "66 Y 0F 6F r1 R2", 0},  /* movdqa r0,r1 */
   {MIR_UNSPEC, "c" STR_VAL (MOVDQA_CODE) " r md", "66 Y 0F 6F r1 m2", 0}, /* movdqa r0,m128 */
   {MIR_UNSPEC, "c" STR_VAL (MOVDQA_CODE) " md r", "66 Y 0F 7F r2 m1", 0}, /* movdqa m128,r0 */
+#if defined(MIR_WIN64_UNWIND)
+  {MIR_UNSPEC, "c" STR_VAL (PUSH_RBP_CODE) " r", "55", 0}, /* push %rbp */
+  {MIR_UNSPEC, "c" STR_VAL (POP_RBP_CODE) " r", "5D", 0},  /* pop %rbp */
+#endif
 
   {MIR_EXT8, "r r", "X 0F BE r0 R1", 0},    /* movsx r0,r1 */
   {MIR_EXT8, "r m0", "X 0F BE r0 m1", 0},   /* movsx r0,m1 */
@@ -2955,6 +3403,13 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
 
   gen_assert (curr_func_item->item_type == MIR_func_item);
   translate_init (gen_ctx);
+#if defined(MIR_WIN64_UNWIND)
+  prolog_op_cursor = 0; /* the builder keeps the prologue layout from machinize */
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  /* The full function starts in the real entry state.  */
+  dwarf_translate_start (gen_ctx, curr_func_item, 0);
+#endif
   curr_size = 0;
   VARR_TRUNC (int, insn_pattern_indexes, 0);
   for (insn = DLIST_HEAD (MIR_insn_t, curr_func_item->u.func->insns); insn != NULL;
@@ -2993,6 +3448,12 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
       size_t len_before = VARR_LENGTH (uint8_t, result_code);
 #endif
       out_insn (gen_ctx, insn, patterns[ind].replacement, NULL);
+#if defined(MIR_WIN64_UNWIND)
+      win64_translate_record (gen_ctx, insn);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+      dwarf_translate_record (gen_ctx, insn);
+#endif
 #ifndef NDEBUG
       size_t insn_len = VARR_LENGTH (uint8_t, result_code) - len_before;
       if (insn_len > (size_t) patterns[ind].max_insn_size && insn->code != MIR_SWITCH) {
@@ -3003,6 +3464,13 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
 #endif
     }
   }
+#if defined(MIR_WIN64_UNWIND)
+  exec_end = VARR_LENGTH (uint8_t, result_code);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  /* The trailing constant pool is data, it must not be inside the FDE.  */
+  dwarf_exec_end = VARR_LENGTH (uint8_t, result_code);
+#endif
   return translate_finish (gen_ctx, len);
 }
 
@@ -3106,6 +3574,9 @@ static void target_init_bb_version_data (target_bb_version_t data) {
 }
 
 static void target_bb_translate_start (gen_ctx_t gen_ctx) {
+#if defined(MIR_WIN64_UNWIND)
+  prolog_op_cursor = 0; /* the entry fragment re-collects the prologue offsets */
+#endif
   VARR_TRUNC (uint8_t, result_code, 0);
   VARR_TRUNC (uint64_t, const_pool, 0);
   VARR_TRUNC (const_ref_t, const_refs, 0);
@@ -3118,13 +3589,37 @@ static void target_bb_insn_translate (gen_ctx_t gen_ctx, MIR_insn_t insn, void *
   int ind = find_insn_pattern (gen_ctx, insn, &ind); /* &ind for no short jumps */
   gen_assert (ind >= 0);
   out_insn (gen_ctx, insn, patterns[ind].replacement, jump_addrs);
+#if defined(MIR_WIN64_UNWIND)
+  /* The entry fragment starts at the function head, so its prologue offsets are
+     the same as for the full function code: they are collected here for the
+     lazy bb mode where the full function code is never translated.  */
+  win64_translate_record (gen_ctx, insn);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  dwarf_translate_record (gen_ctx, insn);
+#endif
 }
 
 static void target_output_jump (gen_ctx_t gen_ctx, void **jump_addrs) {
   out_insn (gen_ctx, temp_jump, patterns[temp_jump_pat_ind].replacement, jump_addrs);
 }
 
+#if defined(MIR_DWARF_UNWIND)
+/* Called before target_bb_translate_start: the fragment of FUNC_ITEM is
+   translated either as the function entry (KIND 1) or as an internal one
+   (KIND 2).  */
+static void target_dwarf_bb_start (gen_ctx_t gen_ctx, MIR_item_t func_item, int kind) {
+  dwarf_translate_start (gen_ctx, func_item, kind);
+}
+#endif
+
 static uint8_t *target_bb_translate_finish (gen_ctx_t gen_ctx, size_t *len) {
+#if defined(MIR_WIN64_UNWIND)
+  exec_end = VARR_LENGTH (uint8_t, result_code);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  dwarf_exec_end = VARR_LENGTH (uint8_t, result_code);
+#endif
   while (VARR_LENGTH (uint8_t, result_code) % 16 != 0) /* Align the pool */
     VARR_PUSH (uint8_t, result_code, 0);
   for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) { /* Add pool constants */
@@ -3204,6 +3699,404 @@ static void target_redirect_bb_origin_branch (gen_ctx_t gen_ctx, target_bb_versi
   data->base = NULL;
 }
 
+#if defined(MIR_WIN64_UNWIND)
+static struct target_frame_desc *win64_find_frame_desc (gen_ctx_t gen_ctx, MIR_item_t func_item) {
+  struct target_frame_desc *d;
+
+  for (d = frame_descs; d != NULL; d = d->next)
+    if (d->func_item == func_item) return d;
+  return NULL;
+}
+
+static uint8_t *win64_copy_info (gen_ctx_t gen_ctx, const uint8_t *info, size_t len,
+                                 size_t *copy_len) {
+  uint8_t *res;
+
+  if (len == 0) {
+    *copy_len = 0;
+    return NULL;
+  }
+  if ((res = MIR_malloc (gen_alloc (gen_ctx), len)) == NULL) gen_assert (FALSE);
+  memcpy (res, info, len);
+  *copy_len = len;
+  return res;
+}
+
+/* Build a builder holding the current prologue operations with zero code
+   offsets.  It is enough for the inherited rules (used by bb fragments and bb
+   thunks), whose prologue is already executed elsewhere.  SAVE_DELTA is added to
+   the explicit stack offsets of the save operations: the unwinder takes them
+   relative to the RSP at the point of the save, so a bb thunk which subtracts its
+   own reservation before the body rules are applied has to move them by that
+   reservation (a frame register based base does not move, so SAVE_DELTA is zero
+   there).  */
+static void win64_build_unoffset_builder (gen_ctx_t gen_ctx,
+                                          struct mir_win64_unwind_builder *b,
+                                          uint32_t save_delta) {
+  size_t i, n = VARR_LENGTH (target_prolog_op_t, prolog_ops);
+
+  mir_win64_unwind_init (b);
+  b->frame_register = unwind_builder.frame_register;
+  b->frame_offset_bytes = unwind_builder.frame_offset_bytes;
+  for (i = 0; i < n; i++) {
+    target_prolog_op_t *op = &VARR_ADDR (target_prolog_op_t, prolog_ops)[i];
+
+    switch (op->kind) {
+    case WINOP_PUSH: mir_win64_unwind_push_nonvol (b, 0, op->reg); break;
+    case WINOP_ALLOC: mir_win64_unwind_alloc (b, 0, op->value); break;
+    case WINOP_SET_FPREG: mir_win64_unwind_set_fpreg (b, 0); break;
+    case WINOP_SAVE_GPR:
+      mir_win64_unwind_save_nonvol (b, 0, op->reg, op->value + save_delta);
+      break;
+    case WINOP_SAVE_XMM:
+      mir_win64_unwind_save_xmm128 (b, 0, op->reg, op->value + save_delta);
+      break;
+    default: break;
+    }
+  }
+}
+
+/* Remember the immutable unwind description of FUNC_ITEM: the code generation
+   state of the function is gone after generate_func_code but its lazy bb
+   fragments and bb thunks need the rule later.  The real (prologue offset
+   carrying) info is added when the code is published.  */
+static void win64_create_frame_desc (gen_ctx_t gen_ctx, MIR_item_t func_item, int has_frame_p) {
+  struct target_frame_desc *d;
+  struct mir_win64_unwind_builder b;
+  uint8_t buf[MIR_WIN64_UNWIND_MAX_BYTES];
+  size_t len;
+
+  if ((d = MIR_malloc (gen_alloc (gen_ctx), sizeof (struct target_frame_desc))) == NULL)
+    gen_assert (FALSE);
+  memset (d, 0, sizeof (struct target_frame_desc));
+  d->func_item = func_item;
+  d->has_frame_p = has_frame_p;
+  win64_build_unoffset_builder (gen_ctx, &b, 0);
+  len = mir_win64_unwind_encode (&b, 1, buf, sizeof (buf));
+  if (len == 0) gen_assert (FALSE);
+  d->inherit_info = win64_copy_info (gen_ctx, buf, len, &d->inherit_len);
+  /* The bb thunk and the wrapper call it makes need the stack adjustment on top
+     of the inherited rule; all code offsets are zero there as well.  A frameless
+     body keeps its saves relative to RSP, which the thunk lowers by the
+     reservation before the body rules apply, so they move with it.  */
+  win64_build_unoffset_builder (gen_ctx, &b, b.frame_register == 0 ? 32 : 0);
+  b.size_of_prolog = 0;
+  mir_win64_unwind_alloc (&b, 0, 32);
+  len = mir_win64_unwind_encode (&b, 1, buf, sizeof (buf));
+  if (len == 0) gen_assert (FALSE);
+  d->b32_info = win64_copy_info (gen_ctx, buf, len, &d->b32_len);
+  win64_build_unoffset_builder (gen_ctx, &b, b.frame_register == 0 ? 40 : 0);
+  b.size_of_prolog = 0;
+  mir_win64_unwind_alloc (&b, 0, 40);
+  len = mir_win64_unwind_encode (&b, 1, buf, sizeof (buf));
+  if (len == 0) gen_assert (FALSE);
+  d->b40_info = win64_copy_info (gen_ctx, buf, len, &d->b40_len);
+  d->next = frame_descs;
+  frame_descs = d;
+}
+
+static void win64_set_real_info (gen_ctx_t gen_ctx, struct target_frame_desc *d,
+                                 const uint8_t *info, size_t len) {
+  if (d->real_info != NULL) return;
+  d->real_info = win64_copy_info (gen_ctx, info, len, &d->real_len);
+}
+
+/* Publish code of FUNC_ITEM: KIND is 0 for the function code, 1 for its entry
+   bb fragment, and 2 for any other bb fragment.  */
+static uint8_t *target_win64_publish (gen_ctx_t gen_ctx, MIR_item_t func_item, const uint8_t *code,
+                                      size_t code_len, int kind) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  struct _MIR_code_unwind uw;
+  struct target_frame_desc *desc;
+  const uint8_t *info = NULL;
+  uint8_t buf[MIR_WIN64_UNWIND_MAX_BYTES];
+  size_t info_len = 0, len;
+  uint8_t *res;
+
+  desc = win64_find_frame_desc (gen_ctx, func_item);
+  if (kind == 0) { /* the function code: its own frame rule is encoded here */
+    if (!unwind_present_p) return _MIR_publish_code (ctx, code, code_len);
+    if ((len = mir_win64_unwind_encode (&unwind_builder, 0, buf, sizeof (buf))) == 0) {
+      MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                "cannot encode Windows x64 unwind information");
+      return NULL;
+    }
+    if (desc != NULL) win64_set_real_info (gen_ctx, desc, buf, len);
+    info = buf;
+    info_len = len;
+  } else if (desc == NULL || !desc->has_frame_p) { /* a leaf: the default leaf rule */
+    return _MIR_publish_code (ctx, code, code_len);
+  } else if (kind == 1) { /* the entry fragment repeats the function prologue */
+    if (desc->real_info == NULL) {
+      if ((len = mir_win64_unwind_encode (&unwind_builder, 0, buf, sizeof (buf))) == 0) {
+        MIR_get_error_func (ctx) (MIR_wrong_param_value_error,
+                                  "cannot encode Windows x64 unwind information");
+        return NULL;
+      }
+      win64_set_real_info (gen_ctx, desc, buf, len);
+    }
+    info = desc->real_info;
+    info_len = desc->real_len;
+  } else { /* an internal fragment: the frame is already set up */
+    info = desc->inherit_info;
+    info_len = desc->inherit_len;
+  }
+  uw.begin = 0;
+  uw.end = exec_end;
+  uw.info = info;
+  uw.info_len = info_len;
+  if (info == NULL || info_len == 0 || exec_end == 0)
+    return _MIR_publish_code (ctx, code, code_len);
+  res = _MIR_publish_code_with_unwind (ctx, code, code_len, 1, &uw);
+  return res;
+}
+
+static void *target_win64_get_bb_thunk (gen_ctx_t gen_ctx, MIR_item_t func_item, void *bb_version,
+                                        void *handler, int entry_p) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  struct target_frame_desc *desc = win64_find_frame_desc (gen_ctx, func_item);
+  size_t adjust;
+  int body_sp_mod16;
+
+  /* A jcall/jret continuation is entered by a jump with RSP 0 modulo 16 and has
+     no return address on its entry stack: its thunk only describes the wrapper
+     call, never the (undescribable) continuation frame.  */
+  if (func_item->u.func->jret_p)
+    return _MIR_get_bb_thunk_win64 (ctx, bb_version, handler, 32, NULL, 0, NULL, 0);
+  /* A bb thunk is entered by a jump, so the enclosing frame RSP is in effect:
+     0 modulo 16 in a function with a stack frame, 8 in a real leaf.  The entry
+     thunk is always entered by a call.  */
+  body_sp_mod16 = (entry_p || desc == NULL || !desc->has_frame_p) ? 8 : 0;
+  adjust = body_sp_mod16 == 8 ? 40 : 32;
+  if (entry_p || desc == NULL || !desc->has_frame_p)
+    return _MIR_get_bb_thunk_win64 (ctx, bb_version, handler, adjust, NULL, 0, NULL, 0);
+  return _MIR_get_bb_thunk_win64 (ctx, bb_version, handler, adjust, desc->inherit_info,
+                                  desc->inherit_len, adjust == 32 ? desc->b32_info : desc->b40_info,
+                                  adjust == 32 ? desc->b32_len : desc->b40_len);
+}
+#endif
+
+#if defined(MIR_DWARF_UNWIND)
+static struct target_dwarf_frame_desc *dwarf_find_frame_desc (gen_ctx_t gen_ctx,
+                                                             MIR_item_t func_item) {
+  struct target_dwarf_frame_desc *d;
+
+  for (d = dwarf_descs; d != NULL; d = d->next)
+    if (d->func_item == func_item) return d;
+  return NULL;
+}
+
+/* Append the DWARF op of EV to S, keeping the CFA rule state in *CFA_REG and
+   *CFA_OFF (no code offset is emitted: the callers place the rows).  */
+static void dwarf_emit_event (VARR (uint8_t) * s, uint8_t *cfa_reg, uint64_t *cfa_off,
+                             const target_cfi_event_t *ev) {
+  switch (ev->kind) {
+  case DWOP_OFFSET: mir_dwarf_cfi_offset (s, ev->reg, ev->value); break;
+  case DWOP_RESTORE: mir_dwarf_cfi_restore (s, ev->reg); break;
+  case DWOP_DEF_CFA:
+    mir_dwarf_cfi_def_cfa (s, ev->reg, (uint64_t) ev->value);
+    *cfa_reg = ev->reg;
+    *cfa_off = (uint64_t) ev->value;
+    break;
+  default: gen_assert (FALSE); break;
+  }
+}
+
+/* Remember the immutable frame description of FUNC_ITEM.  The translation
+   state is gone after generate_func_code, but the lazy bb fragments and the bb
+   thunks of the function need the rules (the bodies of the fragments start in
+   the middle of the frame and the thunks add their own stack adjustment).  */
+static void dwarf_create_frame_desc (gen_ctx_t gen_ctx, MIR_item_t func_item, int has_frame_p) {
+  struct target_dwarf_frame_desc *d;
+  uint8_t cfa_reg = MIR_DWARF_RSP;
+  uint64_t cfa_off = 8;
+  size_t i, n = VARR_LENGTH (target_cfi_event_t, cfi_events), n_prolog = cfi_n_prolog;
+
+  memset (d = gen_malloc (gen_ctx, sizeof (struct target_dwarf_frame_desc)), 0,
+          sizeof (struct target_dwarf_frame_desc));
+  d->func_item = func_item;
+  d->has_frame_p = has_frame_p;
+  d->n_events = n;
+  d->n_prolog = n_prolog;
+  if (n != 0) {
+    d->events = gen_malloc (gen_ctx, n * sizeof (target_cfi_event_t));
+    memcpy (d->events, VARR_ADDR (target_cfi_event_t, cfi_events), n * sizeof (target_cfi_event_t));
+  }
+  /* The body rules: the prologue events without any code offset.  */
+  VARR_TRUNC (uint8_t, cfi_work, 0);
+  for (i = 0; i < n_prolog; i++) dwarf_emit_event (cfi_work, &cfa_reg, &cfa_off, &d->events[i]);
+  if ((d->body_len = VARR_LENGTH (uint8_t, cfi_work)) != 0) {
+    d->body_info = gen_malloc (gen_ctx, d->body_len);
+    memcpy (d->body_info, VARR_ADDR (uint8_t, cfi_work), d->body_len);
+  }
+  d->cfa_reg = cfa_reg;
+  d->cfa_off = cfa_off;
+  /* replace the description of a re-generated item instead of accumulating them */
+  for (struct target_dwarf_frame_desc **pd = &dwarf_descs; *pd != NULL; pd = &(*pd)->next)
+    if ((*pd)->func_item == func_item) {
+      struct target_dwarf_frame_desc *old = *pd;
+
+      *pd = old->next;
+      if (old->events != NULL) MIR_free (gen_alloc (gen_ctx), old->events);
+      if (old->body_info != NULL) MIR_free (gen_alloc (gen_ctx), old->body_info);
+      MIR_free (gen_alloc (gen_ctx), old);
+      break;
+    }
+  d->next = dwarf_descs;
+  dwarf_descs = d;
+  VARR_TRUNC (uint8_t, cfi_work, 0);
+}
+
+/* Start the call frame information of one translation.  KIND is 0 for the
+   function code, 1 for its entry bb fragment (which starts at the function
+   head) and 2 for any other fragment (which starts in the middle of the
+   frame).  */
+static void dwarf_translate_start (gen_ctx_t gen_ctx, MIR_item_t func_item, int kind) {
+  struct target_dwarf_frame_desc *desc;
+
+  gen_assert (kind == 0 || kind == 1 || kind == 2);
+  VARR_TRUNC (uint8_t, cfi_stream, 0);
+  cfi_row_off = 0;
+  cfi_event_cursor = 0;
+  dwarf_cfa_reg = MIR_DWARF_RSP;
+  dwarf_cfa_off = 8;
+  dwarf_cur_desc = desc = dwarf_find_frame_desc (gen_ctx, func_item);
+  dwarf_cfi_p = desc != NULL && !func_item->u.func->jret_p;
+  if (!dwarf_cfi_p) return;
+  if (kind == 2) {
+    cfi_event_cursor = desc->n_prolog;
+    if (desc->body_len != 0) VARR_PUSH_ARR (uint8_t, cfi_stream, desc->body_info, desc->body_len);
+    dwarf_cfa_reg = desc->cfa_reg;
+    dwarf_cfa_off = desc->cfa_off;
+  }
+}
+
+/* A `sub`/`add` of RSP outside the prologue/epilogue moves the CFA when the CFA
+   is RSP based.  The stack arguments of a call are such a case for hand written
+   MIR (a call with stack arguments forces a frame register, so the rule does not
+   fire for generated code), and this is the safety net for any other RSP
+   arithmetic which the generator does not record itself.  A bb fragment which
+   starts between such a `sub` and its `add` still gets the prologue CFA state:
+   that limit is inherent to an RSP based body rule.  */
+static void dwarf_record_sp_adjust (gen_ctx_t gen_ctx, MIR_insn_t insn, size_t off) {
+  int64_t delta;
+
+  if (dwarf_cfa_reg != MIR_DWARF_RSP || insn->nops != 3) return;
+  if (insn->code != MIR_SUB && insn->code != MIR_ADD) return;
+  if (insn->ops[0].mode != MIR_OP_VAR || insn->ops[0].u.var != SP_HARD_REG
+      || insn->ops[1].mode != MIR_OP_VAR || insn->ops[1].u.var != SP_HARD_REG)
+    return;
+  if (insn->ops[2].mode == MIR_OP_INT) {
+    delta = insn->ops[2].u.i;
+  } else if (insn->ops[2].mode == MIR_OP_UINT) {
+    delta = (int64_t) insn->ops[2].u.u;
+  } else {
+    return;
+  }
+  if (insn->code == MIR_SUB) {
+    dwarf_cfa_off += (uint64_t) delta;
+  } else {
+    dwarf_cfa_off -= (uint64_t) delta;
+  }
+  if (off > cfi_row_off) {
+    mir_dwarf_cfi_advance (cfi_stream, cfi_row_off, off);
+    cfi_row_off = off;
+  }
+  mir_dwarf_cfi_def_cfa (cfi_stream, MIR_DWARF_RSP, dwarf_cfa_off);
+}
+
+/* Emit the row(s) of INSN (which has just been translated, its machine code
+   ends at the current result code length).  */
+static void dwarf_translate_record (gen_ctx_t gen_ctx, MIR_insn_t insn) {
+  size_t off = VARR_LENGTH (uint8_t, result_code);
+  int recorded_p = 0;
+
+  if (!dwarf_cfi_p) return;
+  while (cfi_event_cursor < dwarf_cur_desc->n_events
+         && dwarf_cur_desc->events[cfi_event_cursor].insn == insn) {
+    if (off > cfi_row_off) {
+      mir_dwarf_cfi_advance (cfi_stream, cfi_row_off, off);
+      cfi_row_off = off;
+    }
+    dwarf_emit_event (cfi_stream, &dwarf_cfa_reg, &dwarf_cfa_off,
+                      &dwarf_cur_desc->events[cfi_event_cursor++]);
+    recorded_p = 1;
+  }
+  if (!recorded_p) dwarf_record_sp_adjust (gen_ctx, insn, off);
+}
+
+/* Publish the translated code together with the rows collected for it.  */
+static uint8_t *target_dwarf_publish (gen_ctx_t gen_ctx, const uint8_t *code, size_t code_len) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  struct _MIR_code_unwind uw;
+  size_t end = dwarf_exec_end == 0 ? code_len : dwarf_exec_end;
+
+  if (!dwarf_cfi_p) return _MIR_publish_code (ctx, code, code_len);
+  /* The rows belong to this translation and the range must not cover the
+     trailing pool.  A missing end means the caller never translated through
+     target_translate/target_bb_translate_finish: publish without the rows rather
+     than describe the wrong interval.  */
+  if (dwarf_exec_end == 0 || dwarf_exec_end > code_len) {
+    gen_assert (dwarf_exec_end != 0 && dwarf_exec_end <= code_len);
+    return _MIR_publish_code (ctx, code, code_len);
+  }
+  uw.begin = 0;
+  uw.end = end;
+  uw.info = VARR_ADDR (uint8_t, cfi_stream);
+  uw.info_len = VARR_LENGTH (uint8_t, cfi_stream);
+  return _MIR_publish_code_with_unwind (ctx, code, code_len, 1, &uw);
+}
+
+/* The bb thunk of a Linux function calls the shared bb wrapper (so the wrapper
+   has a real return address), which needs the red zone of the enclosing frame
+   kept free.  The reservation has to keep the call 16-byte aligned: ADJUST is 136
+   for a function entry and for the body of a real leaf (RSP is 8 modulo 16
+   there), and 128 for the body of any function with a prologue, whose allocation
+   makes RSP 16-byte aligned (a frame-less non-leaf included).  */
+static void *target_dwarf_get_bb_thunk (gen_ctx_t gen_ctx, MIR_item_t func_item, void *bb_version,
+                                        void *handler, int entry_p) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  struct target_dwarf_frame_desc *desc;
+  const uint8_t *inherited = NULL, *adjusted = NULL;
+  size_t inherited_len = 0, adjusted_len = 0;
+  size_t adjust;
+  void *res;
+
+  /* A jcall/jret continuation has no return address on its entry stack and runs
+     with RSP 16-byte aligned (its own prologue subtracts a multiple of 16), so
+     its thunk only reserves the red zone and gets no frame description at all.  */
+  if (func_item->u.func->jret_p)
+    return _MIR_get_bb_thunk_dwarf (ctx, bb_version, handler, 128, 0, NULL, 0, NULL, 0);
+  desc = dwarf_find_frame_desc (gen_ctx, func_item);
+  gen_assert (desc != NULL); /* every generated function gets one in machinize */
+  /* 136 keeps the wrapper call 16-byte aligned when the enclosing RSP is 8
+     modulo 16: a function entry and the body of a real leaf (which changes
+     neither RSP nor a non-volatile register).  128 is used for the body of every
+     function with a prologue: its allocation makes RSP 16-byte aligned (also for
+     a frame-less non-leaf, whose allocation is a multiple of 16 plus 8).  */
+  adjust = (entry_p || desc == NULL || !desc->has_frame_p) ? 136 : 128;
+  VARR_TRUNC (uint8_t, cfi_work, 0);
+  if (entry_p || desc == NULL || !desc->has_frame_p) {
+    /* The thunk starts in the function entry state (or in the body of a leaf,
+       which is the same): only the adjustment is added.  */
+    mir_dwarf_cfi_def_cfa (cfi_work, MIR_DWARF_RSP, 8 + adjust);
+  } else {
+    inherited = desc->body_info;
+    inherited_len = desc->body_len;
+    if (inherited_len != 0) VARR_PUSH_ARR (uint8_t, cfi_work, inherited, inherited_len);
+    /* A frame register based CFA does not change with the adjustment.  */
+    if (desc->cfa_reg == MIR_DWARF_RSP)
+      mir_dwarf_cfi_def_cfa (cfi_work, MIR_DWARF_RSP, desc->cfa_off + adjust);
+  }
+  adjusted = VARR_ADDR (uint8_t, cfi_work);
+  adjusted_len = VARR_LENGTH (uint8_t, cfi_work);
+  res = _MIR_get_bb_thunk_dwarf (ctx, bb_version, handler, adjust, 1, inherited, inherited_len,
+                                 adjusted, adjusted_len);
+  VARR_TRUNC (uint8_t, cfi_work, 0);
+  return res;
+}
+#endif
+
 static void target_init (gen_ctx_t gen_ctx) {
   MIR_alloc_t alloc = gen_alloc (gen_ctx);
   MIR_context_t ctx = gen_ctx->ctx;
@@ -3217,9 +4110,36 @@ static void target_init (gen_ctx_t gen_ctx) {
   VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
   VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
   VARR_CREATE (call_ref_t, gen_ctx->target_ctx->call_refs, alloc, 0);
+#if defined(MIR_WIN64_UNWIND)
+  VARR_CREATE (target_prolog_op_t, prolog_ops, alloc, 16);
+  prolog_op_cursor = 0;
+  exec_end = 0;
+  unwind_present_p = continuation_p = FALSE;
+  frame_descs = NULL;
+  mir_win64_unwind_init (&unwind_builder);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  VARR_CREATE (target_cfi_event_t, cfi_events, alloc, 16);
+  VARR_CREATE (uint8_t, cfi_stream, alloc, 64);
+  VARR_CREATE (uint8_t, cfi_work, alloc, 64);
+  cfi_n_prolog = cfi_event_cursor = cfi_row_off = dwarf_exec_end = 0;
+  dwarf_descs = dwarf_cur_desc = NULL;
+  dwarf_cfa_reg = MIR_DWARF_RSP;
+  dwarf_cfa_off = 8;
+  dwarf_cfi_p = FALSE;
+#endif
   MIR_type_t res = MIR_T_D;
   MIR_var_t args[] = {{MIR_T_D, "src", 0}};
   _MIR_register_unspec_insn (gen_ctx->ctx, MOVDQA_CODE, "movdqa", 1, &res, 1, FALSE, args);
+#if defined(MIR_WIN64_UNWIND)
+  {
+    MIR_var_t push_args[] = {{MIR_T_I64, "reg", 0}};
+
+    _MIR_register_unspec_insn (gen_ctx->ctx, PUSH_RBP_CODE, "win64_push_rbp", 0, NULL, 1, FALSE,
+                               push_args);
+    _MIR_register_unspec_insn (gen_ctx->ctx, POP_RBP_CODE, "win64_pop_rbp", 1, &res, 0, FALSE, NULL);
+  }
+#endif
   patterns_init (gen_ctx);
   temp_jump = MIR_new_insn (ctx, MIR_JMP, MIR_new_label_op (ctx, NULL));
   temp_jump_pat_ind = find_insn_pattern (gen_ctx, temp_jump, NULL);
@@ -3237,6 +4157,32 @@ static void target_finish (gen_ctx_t gen_ctx) {
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
   VARR_DESTROY (call_ref_t, gen_ctx->target_ctx->call_refs);
+#if defined(MIR_WIN64_UNWIND)
+  while (frame_descs != NULL) {
+    struct target_frame_desc *d = frame_descs;
+
+    frame_descs = d->next;
+    if (d->real_info != NULL) MIR_free (alloc, d->real_info);
+    if (d->inherit_info != NULL) MIR_free (alloc, d->inherit_info);
+    if (d->b32_info != NULL) MIR_free (alloc, d->b32_info);
+    if (d->b40_info != NULL) MIR_free (alloc, d->b40_info);
+    MIR_free (alloc, d);
+  }
+  VARR_DESTROY (target_prolog_op_t, prolog_ops);
+#endif
+#if defined(MIR_DWARF_UNWIND)
+  while (dwarf_descs != NULL) {
+    struct target_dwarf_frame_desc *d = dwarf_descs;
+
+    dwarf_descs = d->next;
+    if (d->events != NULL) MIR_free (alloc, d->events);
+    if (d->body_info != NULL) MIR_free (alloc, d->body_info);
+    MIR_free (alloc, d);
+  }
+  VARR_DESTROY (target_cfi_event_t, cfi_events);
+  VARR_DESTROY (uint8_t, cfi_stream);
+  VARR_DESTROY (uint8_t, cfi_work);
+#endif
   MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }

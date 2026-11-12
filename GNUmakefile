@@ -73,6 +73,20 @@ else
   endif
 
   MIR_LIBS=-lm -ldl
+  # The Linux x86-64 JIT frame information (MIR_DWARF_UNWIND in
+  # mir-unwind-target.h) is registered with __register_frame from libgcc_s:
+  # every consumer of libmir (the static one in particular) needs the dependency
+  # and the shared library needs it in its DT_NEEDED entries.  The predicate is
+  # taken from the predefined macros of the *effective* compiler target (like the
+  # header does), not from the default target triple: `-mx32` and the Android
+  # triples contain both x86_64 and linux but disable the support.
+  CC_DEFS := $(shell $(CC) -dM -E -x c /dev/null 2>/dev/null)
+  ifneq (,$(and $(findstring __linux__,$(CC_DEFS)),$(findstring __x86_64__,$(CC_DEFS)),$(findstring __LP64__,$(CC_DEFS))))
+    ifeq (,$(findstring __ANDROID__,$(CC_DEFS)))
+      MIR_DWARF_UNWIND_P := 1
+      MIR_LIBS += -lgcc_s
+    endif
+  endif
   COPTFLAGS = -O3 -DNDEBUG
   CDEBFLAGS =
   CDEB2FLAGS = -Wall -Wextra -Wshadow -g3 -fsanitize=address -fsanitize=undefined -fno-sanitize=alignment
@@ -161,6 +175,11 @@ debug: $(BUILD_DIR)/libmir.$(LIBSUFF) $(BUILD_DIR)/$(SOLIB) $(EXECUTABLES)
 debug2: CFLAGS:=$(subst $(COPTFLAGS),$(CDEB2FLAGS),$(CFLAGS))
 debug2: LDFLAGS:=$(LD2FLAGS)
 debug2: $(BUILD_DIR)/libmir.$(LIBSUFF) $(BUILD_DIR)/$(SOLIB) $(EXECUTABLES)
+ifdef MIR_DWARF_UNWIND_P
+# the target specific CFLAGS/LDFLAGS above reach the prerequisites of debug2, so
+# the unwind test is built and run with the sanitizers too
+debug2: dwarf-unwind-test
+endif
 
 install: $(BUILD_DIR)/libmir.$(LIBSUFF) $(BUILD_DIR)/$(SOLIB) $(EXECUTABLES) | $(PREFIX)/include $(PREFIX)/lib $(PREFIX)/bin
 	install -m a+r $(SRC_DIR)/mir.h $(SRC_DIR)/mir-alloc.h $(SRC_DIR)/mir-code-alloc.h $(SRC_DIR)/mir-dlist.h $(SRC_DIR)/mir-varr.h $(SRC_DIR)/mir-htab.h\
@@ -198,12 +217,16 @@ endif
 	-rmdir $(PREFIX)/include $(PREFIX)/lib $(PREFIX)/bin
 	-rmdir $(PREFIX)
 
-clean: clean-mir clean-c2m clean-utils clean-l2m clean-adt-tests clean-mir-tests clean-mir2c-test clean-bench
+clean: clean-mir clean-c2m clean-utils clean-l2m clean-adt-tests clean-mir-tests clean-mir2c-test clean-bench clean-dwarf-unwind-test
 	$(RM) $(EXECUTABLES) $(BUILD_DIR)/libmir.$(LIBSUFF) $(BUILD_DIR)/$(SOLIB)
 
 test: header-test readme-example-test mir-bin-run-test c2mir-test
 
 test-all: adt-test simplify-test io-test scan-test mir2c-test $(L2M-TEST) test
+
+ifdef MIR_DWARF_UNWIND_P
+test-all: dwarf-unwind-test
+endif
 
 bench: interp-bench gen-bench gen-bench2 io-bench mir2c-bench c2mir-sieve-bench gen-speed c2mir-bench
 	@echo ==============================Bench is done
@@ -234,7 +257,7 @@ $(BUILD_DIR)/$(SOLIB): $(BUILD_DIR)/mir.$(OBJSUFF) $(BUILD_DIR)/mir-gen.$(OBJSUF
 ifeq ($(CC),cl)
 	$(CC) -nologo -D_USRDLL -D_WINDLL $^ -link -DLL -OUT:$@
 else
-	$(CC) $(SOLIBFLAGS) -o $@ $^
+	$(CC) $(SOLIBFLAGS) -o $@ $^ $(LDLIBS)
 endif
 
 # ------------------ C2M --------------------------
@@ -597,6 +620,22 @@ mir-bin-run-test: $(BUILD_DIR)/mir-bin-run$(EXE) $(BUILD_DIR)/c2m$(EXE)
 	      MIR_TYPE=lazy $(BUILD_DIR)/mir-bin-run$(EXE) `pwd`/sieve.bmir sieve.bmir
 	      rm sieve.bmir
 	
+
+# ------------------ Linux x86-64 JIT unwinding test ----------------
+
+.PHONY: dwarf-unwind-test clean-dwarf-unwind-test
+
+DWARF_UNWIND_TEST = $(BUILD_DIR)/mir-tests/linux-dwarf-unwind$(EXE)
+
+# the test also compiles C with c2mir (the jcall/jret continuation scenario)
+dwarf-unwind-test: $(BUILD_DIR)/mir.$(OBJSUFF) $(BUILD_DIR)/mir-gen.$(OBJSUFF)\
+                           $(BUILD_DIR)/c2mir/c2mir.$(OBJSUFF)\
+                           $(SRC_DIR)/mir-tests/linux-dwarf-unwind.cpp | $(BUILD_DIR)/mir-tests
+	$(CXX) $(CPPFLAGS) -std=gnu++17 -O2 -g -fexceptions $(LDFLAGS) -o $(DWARF_UNWIND_TEST) $^ $(LDLIBS)
+	$(DWARF_UNWIND_TEST)
+
+clean-dwarf-unwind-test:
+	$(RM) $(DWARF_UNWIND_TEST)
 
 # ------------------ readme example test ----------------
 
